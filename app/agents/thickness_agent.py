@@ -14,16 +14,19 @@ from app.models.job import ThicknessMethod, ThicknessResult
 logger = logging.getLogger("patchforge.agents.thickness")
 
 ROLE = (
-    "You are the thickness decision engine in a photo-to-3D-print repair pipeline. "
-    "The target printer is a Bambu Lab A1 with a maximum build volume of "
-    "256 x 256 x 256 mm. "
-    "Multiple thickness estimation strategies have been run — LiDAR depth difference, "
-    "video multi-view stereo, side-photo analysis, monocular depth inference, and/or "
-    "vision-based estimation. Each produced an independent thickness estimate. "
-    "YOUR JOB is to decide which estimate to trust, whether to blend, and what the "
-    "final authoritative thickness should be. Consider physical plausibility: repair "
-    "patches are typically 1-20mm thick. A 20mm-wide break is unlikely to be 0.5mm "
-    "deep. You MUST pick one final answer."
+    "You are the thickness decision engine in a photo-to-3D-print patch pipeline. "
+    "The target printer is a Bambu Lab A1 (build volume: 256 x 256 x 256 mm). "
+    "Thickness means the DEPTH of the replacement patch — how thick the wall/shell "
+    "was where it broke. This is NOT the width or height of the gap. "
+    "Multiple thickness estimation strategies may produce independent estimates: "
+    "LiDAR depth difference, video multi-view stereo, side-photo analysis, "
+    "monocular depth inference, and/or vision-based proportional reasoning. "
+    "YOUR JOB is to decide which estimate to trust, whether to blend them, and "
+    "what the final authoritative patch thickness should be. Base your decision "
+    "ONLY on evidence from the measurement methods. Do NOT infer thickness from "
+    "material type or generic object assumptions. Physically plausible patch "
+    "thickness is typically 1-30mm. The minimum printable wall is 0.8mm. "
+    "You MUST pick one final answer."
 )
 
 CONSENSUS_SCHEMA = {
@@ -161,17 +164,16 @@ class ThicknessAgent(Agent):
         prompt += f"Spread: {spread:.2f} mm (max - min)\n"
 
         prompt += (
-            f"\nPhysical constraints and heuristics:\n"
-            f"- Repair patches are typically 1-20mm thick\n"
-            f"- The break is {width_mm:.1f}mm wide — thickness should be physically proportional\n"
-            f"- 3D-printed plastic walls: typically 2-4mm (most common in repair scenarios)\n"
-            f"- Injection-molded plastic: typically 1.5-3mm\n"
-            f"- Ceramic or porcelain: typically 3-8mm; metal brackets: 1-4mm\n"
-            f"- The visible break edge cross-section (from side photo or vision) is the most reliable indicator\n"
-            f"- Vision estimates based on proportional reasoning with a reference object are more trustworthy than monocular depth\n"
+            f"\nDecision guidelines:\n"
+            f"- The break is {width_mm:.1f}mm wide — thickness must be physically plausible relative to this\n"
+            f"- Do NOT guess thickness from material type or generic assumptions\n"
+            f"- Only trust methods that have direct physical evidence (side photo, LiDAR depth, "
+            f"visible break edge with proportional reasoning against a reference object)\n"
+            f"- Vision estimates based on proportional reasoning with a reference object are the most trustworthy\n"
             f"- Monocular depth estimates (confidence < 0.4) should only be used as a last resort\n"
+            f"- If the highest confidence candidate is still below 0.3, report low confidence honestly\n"
             f"- When in doubt, prefer the estimate from the method with the most direct physical evidence\n\n"
-            f"Your decision:\n"
+            f"Respond with a JSON object containing your decision:\n"
             f'- "chosen_method": which method to trust (or "blended" if averaging)\n'
             f'- "final_thickness_mm": the authoritative thickness in mm\n'
             f'- "confidence": your confidence (0.0-1.0)\n'
@@ -211,11 +213,15 @@ class ThicknessAgent(Agent):
                 num_views_used=max(r.num_views_used for r in results),
             )
 
+            raw_suggestions = parsed.get("suggestions", [])
+            if isinstance(raw_suggestions, str):
+                raw_suggestions = [raw_suggestions] if raw_suggestions else []
+
             analysis = AgentResult(
                 success=parsed.get("should_proceed", True),
                 data={"candidates": candidates, "chosen": chosen_method},
                 reasoning=parsed.get("reasoning", ""),
-                suggestions=parsed.get("suggestions", []),
+                suggestions=raw_suggestions,
                 confidence=confidence,
             )
 

@@ -9,16 +9,15 @@ from app.agents.base import Agent, AgentResult
 from app.models.job import MeasurementResult
 
 ROLE = (
-    "You are a dimensional analysis expert for 3D-printable repair parts. "
-    "The target printer is a Bambu Lab A1 with a maximum build volume of "
-    "256 x 256 x 256 mm. "
-    "You evaluate whether measured dimensions are plausible for real-world objects "
-    "and whether they fit within the printer's build volume. "
-    "Common repair parts (clips, brackets, covers) are typically 5-150mm. "
-    "Flag measurements outside this range as potential calibration errors, "
+    "You are a dimensional analysis expert for 3D-printable repair patches. "
+    "The target printer is a Bambu Lab A1 (build volume: 256 x 256 x 256 mm). "
+    "You evaluate the dimensions of the GAP/VOID left by a broken-off piece — "
+    "these dimensions determine the size of the replacement PATCH we will print. "
+    "You are NOT measuring the whole object, only the missing piece area. "
+    "Common repair patches are typically 5-150mm. "
+    "Flag measurements below 2mm or above 200mm as potential calibration errors, "
     "and flag any dimension exceeding 256mm as unprintable on this printer. "
-    "When shown an image, look at shadows, edges, and visible break lines to "
-    "assess whether the highlighted mask accurately captures the damage extent."
+    "When shown an image, verify the mask covers ONLY the gap, not the whole object."
 )
 
 
@@ -91,19 +90,20 @@ class MeasurementAgent(Agent):
 
         vision_prompt = (
             "The attached image shows the broken object with the detected damage "
-            "mask highlighted in GREEN and the measurement bounding box in BLUE. "
-            "The RED contour is the detected damage boundary.\n\n"
+            "mask highlighted in GREEN, the measurement bounding box in BLUE, "
+            "and the RED contour as the detected damage boundary.\n\n"
             "Visually verify:\n"
-            "1. Does the green mask accurately cover ONLY the broken/missing area?\n"
-            "2. Does the blue rectangle tightly fit the actual damage, or is it "
-            "too wide/tall (including shadows or background)?\n"
+            "1. Does the green mask cover ONLY the broken/missing area, without "
+            "including undamaged surfaces, shadows, or background?\n"
+            "2. Does the blue rectangle tightly fit the actual break boundaries?\n"
             "3. Are there visible edges, break lines, or shadows that suggest the "
             "real damage is smaller or larger than what the mask shows?\n"
-            "4. Given the visible context (nearby objects, surface texture), do the "
-            f"computed dimensions ({context['width_mm']:.1f}mm x "
+            "4. Given visible context (nearby objects, reference objects like coins), "
+            f"do the computed dimensions ({context['width_mm']:.1f}mm x "
             f"{context['height_mm']:.1f}mm) seem physically plausible?\n\n"
-            "If the mask appears too large, lower your confidence and suggest "
-            "the user manually click on the damage center for tighter segmentation."
+            "If the mask appears too large or includes non-damage areas, lower "
+            "your confidence and suggest the user manually click on the damage "
+            "center for tighter segmentation."
         )
 
         return await self.analyze_with_vision(

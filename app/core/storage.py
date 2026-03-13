@@ -77,3 +77,16 @@ def job_reference_image_path(job_id: str) -> Path:
 
 def job_side_image_path(job_id: str) -> Path:
     return settings.upload_dir / f"{job_id}_side.png"
+
+
+# --- Visualization outputs (live analysis feedback) ---
+
+def job_viz_dir() -> Path:
+    d = settings.upload_dir / "viz"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def job_viz_path(job_id: str, name: str) -> Path:
+    job_viz_dir()
+    return settings.upload_dir / "viz" / f"{job_id}_{name}.jpg"

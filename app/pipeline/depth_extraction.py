@@ -20,6 +20,9 @@ logger = logging.getLogger("patchforge.depth")
 
 # Known iPhone sensor widths in mm, keyed by EXIF model substring
 _SENSOR_WIDTHS: dict[str, float] = {
+    "iPhone 16 Pro Max": 9.8,
+    "iPhone 16 Pro": 9.8,
+    "iPhone 16": 7.0,
     "iPhone 15 Pro Max": 9.8,
     "iPhone 15 Pro": 9.8,
     "iPhone 15": 7.0,
@@ -40,6 +43,10 @@ def extract_depth_map(image_path: str | Path) -> Optional[np.ndarray]:
     """
     Try to extract a depth map from a HEIF file.
     Returns a float32 numpy array of per-pixel depth values, or None.
+
+    Tries two methods:
+    1. PIL info dict (pillow-heif populates 'depth_images' for some iOS versions)
+    2. Direct HEIF container parsing via pillow_heif.open_heif() auxiliary images
     """
     try:
         from pillow_heif import register_heif_opener
@@ -48,23 +55,58 @@ def extract_depth_map(image_path: str | Path) -> Optional[np.ndarray]:
         logger.debug("pillow-heif not installed — skipping HEIF depth extraction")
         return None
 
+    # Method 1: PIL info dict
     try:
         im = Image.open(str(image_path))
+        depth_images = im.info.get("depth_images")
+        if depth_images:
+            depth_pil = depth_images[0].to_pillow()
+            logger.info("Depth map extracted via PIL info dict from %s", image_path)
+            return np.asarray(depth_pil, dtype=np.float32)
     except Exception as e:
-        logger.warning("Failed to open HEIF image %s: %s", image_path, e)
-        return None
+        logger.debug("PIL depth_images method failed: %s", e)
 
-    depth_images = im.info.get("depth_images")
-    if not depth_images:
-        logger.debug("No depth_images in HEIF metadata for %s", image_path)
-        return None
-
+    # Method 2: Direct HEIF container — enumerate auxiliary images by type
     try:
-        depth_pil = depth_images[0].to_pillow()
-        return np.asarray(depth_pil, dtype=np.float32)
+        import pillow_heif
+
+        heif_file = pillow_heif.open_heif(str(image_path))
+
+        depth_aux_types = (
+            "urn:com:apple:photo:2020:aux:hdepth",
+            "urn:com:apple:photo:2020:aux:depth",
+        )
+
+        for img in heif_file:
+            for aux in getattr(img, "info", {}).get("auxiliary", []):
+                aux_type = getattr(aux, "type", "") or ""
+                if any(t in aux_type for t in depth_aux_types):
+                    aux_pil = aux.to_pillow()
+                    logger.info("Depth map extracted via HEIF auxiliary (%s) from %s", aux_type, image_path)
+                    return np.asarray(aux_pil, dtype=np.float32)
+
+        # Fallback: check top-level images beyond the primary
+        if len(heif_file) > 1:
+            for idx in range(1, len(heif_file)):
+                aux_img = heif_file[idx]
+                w, h = aux_img.size
+                primary = heif_file[0]
+                pw, ph = primary.size
+                if w < pw and h < ph:
+                    aux_pil = aux_img.to_pillow()
+                    arr = np.asarray(aux_pil, dtype=np.float32)
+                    if arr.ndim == 2 or (arr.ndim == 3 and arr.shape[2] == 1):
+                        logger.info(
+                            "Depth map extracted from secondary HEIF image (%dx%d) in %s",
+                            w, h, image_path,
+                        )
+                        return arr.squeeze() if arr.ndim == 3 else arr
+
     except Exception as e:
-        logger.warning("Failed to convert depth image to array: %s", e)
-        return None
+        logger.debug("Direct HEIF container depth extraction failed: %s", e)
+
+    logger.debug("No depth data found in %s", image_path)
+    return None
 
 
 def _get_exif_data(image_path: str | Path) -> dict:

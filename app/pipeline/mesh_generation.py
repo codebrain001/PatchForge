@@ -16,16 +16,51 @@ from app.models.job import MeshResult
 logger = logging.getLogger("patchforge.mesh")
 
 
+def _try_rectangularize(contour: np.ndarray) -> np.ndarray | None:
+    """If the contour is nearly rectangular, snap it to a clean 4-point rectangle.
+
+    Uses minAreaRect to fit the tightest rotated rectangle and checks whether
+    the contour fills at least 60% of it. Returns the 4 box corners as an
+    OpenCV contour, or None if the shape is not rectangular enough.
+    """
+    contour_area = abs(cv2.contourArea(contour))
+    if contour_area < 1:
+        return None
+
+    rect = cv2.minAreaRect(contour)
+    box = cv2.boxPoints(rect)
+    box_area = rect[1][0] * rect[1][1]
+    if box_area < 1:
+        return None
+
+    fill_ratio = contour_area / box_area
+
+    if fill_ratio >= 0.60:
+        logger.info(
+            "Rectangularized contour: fill=%.0f%% of minAreaRect, "
+            "%d vertices -> 4 corners",
+            fill_ratio * 100, len(np.squeeze(contour)),
+        )
+        return box.astype(np.float32).reshape(-1, 1, 2)
+
+    return None
+
+
 def _smooth_contour(contour: np.ndarray, sigma: float = 1.0) -> np.ndarray:
     """Smooth a contour to remove pixel staircase while preserving angular shape.
 
-    For fundamentally simple shapes (rectangles, triangles), uses aggressive
-    polygonal approximation to extract the core shape. Only applies Gaussian
-    smoothing to complex, organic contours that benefit from it.
+    For near-rectangular shapes (>60% fill of their min-area rotated rect),
+    snaps to a clean 4-corner rectangle via minAreaRect. For other simple
+    shapes, uses polygonal approximation. Only applies Gaussian smoothing
+    to complex, organic contours.
     """
     pts = np.squeeze(contour)
-    if pts.ndim != 2 or pts.shape[0] < 5:
+    if pts.ndim != 2 or pts.shape[0] < 3:
         return contour
+
+    rect_result = _try_rectangularize(contour)
+    if rect_result is not None:
+        return rect_result
 
     if pts.shape[0] < 10:
         return contour
@@ -173,7 +208,12 @@ def generate_mesh(
 
     smoothed_contour = _smooth_contour(contour, sigma=sigma)
     smoothed_pts = len(np.squeeze(smoothed_contour))
-    smooth_radius = 0.0 if smoothed_pts <= 12 else 0.3
+
+    if smoothed_pts == 4:
+        simp_tol = 0.0
+        smooth_radius = 0.0
+    else:
+        smooth_radius = 0.0 if smoothed_pts <= 12 else 0.3
 
     poly_px = _contour_to_polygon(smoothed_contour, simp_tol, smooth_radius=smooth_radius)
     poly_mm = _scale_polygon(poly_px, scale_factor)

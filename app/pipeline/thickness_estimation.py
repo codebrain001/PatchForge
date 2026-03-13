@@ -232,21 +232,32 @@ def estimate_from_video_frames(
 
     median_ratio = float(np.median(ratios))
 
-    # Use the smaller dimension as the reference. The larger dimension often
-    # includes alignment artifacts and is less reliable as a proxy for depth.
     ref_dim = measurement_width_mm
     if measurement_height_mm > 0:
         ref_dim = min(measurement_width_mm, measurement_height_mm)
 
-    thickness_mm = median_ratio * ref_dim * settings.depth_width_scale
+    # Monocular depth gives relative contrast, not absolute distance.
+    # Multiply by ref_dim to get a rough mm estimate. No arbitrary scale factor.
+    thickness_mm = median_ratio * ref_dim
     thickness_mm = max(0.5, min(50.0, thickness_mm))
 
-    confidence = min(0.75, 0.3 + 0.1 * len(ratios))
+    # Monocular depth is inherently unreliable for absolute measurements.
+    # Cap confidence to reflect this — it's supporting evidence, not primary.
+    confidence = min(0.40, 0.15 + 0.05 * len(ratios))
     std_dev = float(np.std(ratios)) if len(ratios) > 1 else 0.0
-    if std_dev < 0.05:
-        confidence += 0.1
+    if std_dev < 0.05 and len(ratios) > 1:
+        confidence += 0.05
 
-    confidence = min(0.85, confidence)
+    confidence = min(0.45, confidence)
+
+    # Sanity: if computed thickness < 1mm on an object wider than 10mm,
+    # the depth contrast is too low to be meaningful.
+    if thickness_mm < 1.0 and ref_dim > 10.0:
+        logger.warning(
+            "Video MVS thickness %.2f mm implausible for %.1f mm object — flagging unreliable",
+            thickness_mm, ref_dim,
+        )
+        confidence = min(confidence, 0.15)
 
     logger.info(
         "Video MVS thickness: %.2f mm (ratio=%.4f, %d views, std=%.4f, conf=%.2f)",
@@ -297,21 +308,31 @@ def estimate_from_side_photo(
             hint_text = f" The user estimates the depth is approximately {manual_hint_mm} mm."
 
         system = (
-            "You are a computer vision expert analyzing physical objects for 3D printing repair. "
-            "The target printer is a Bambu Lab A1 (build volume: 256 x 256 x 256 mm)."
+            "You are a computer vision expert estimating patch thickness for 3D printing. "
+            "The target printer is a Bambu Lab A1 (build volume: 256 x 256 x 256 mm). "
+            "You estimate how DEEP the break goes — the wall/shell thickness at the "
+            "fracture point — from side-angle photographs."
         )
         prompt = (
-            "You are analyzing a side-angle photograph of a broken/damaged object. "
-            "The damage area has already been measured from a top-down view:\n"
-            f"  - Width: {measurement_width_mm} mm\n"
-            f"  - Height: {measurement_height_mm} mm\n"
+            "You are analyzing a side-angle photograph of a broken object. We need to "
+            "3D-print a replacement PATCH to fill the gap. The gap dimensions from the "
+            "top-down view are:\n"
+            f"  - Gap width: {measurement_width_mm:.1f} mm\n"
+            f"  - Gap height: {measurement_height_mm:.1f} mm\n"
             f"  - Calibration scale: {scale_factor:.4f} mm per pixel\n"
             f"{hint_text}\n\n"
-            "From this side view, estimate the DEPTH (thickness) of the break/void "
-            "in millimeters. Look for visible edges, shadows, and perspective cues.\n\n"
+            "From this side view, estimate the THICKNESS of the patch — how deep the "
+            "break goes into the object (the wall/shell depth at the fracture). "
+            "This is NOT the width or height of the gap.\n\n"
+            "Use proportional reasoning:\n"
+            "  1. Identify a reference of known size (the object itself, a coin, etc.)\n"
+            "  2. Measure the wall depth at the break in pixels\n"
+            "  3. Convert to mm using the ratio\n\n"
+            "Do NOT guess thickness from material type. Patch thickness is typically "
+            "1-30mm and should be SMALLER than both the gap width and height.\n\n"
             "Respond with ONLY a JSON object:\n"
             '{"thickness_mm": <number>, "confidence": <0.0-1.0>, '
-            '"reasoning": "<brief explanation>"}'
+            '"reasoning": "<show your proportional calculation>"}'
         )
 
         text, provider = call_llm_vision(system, prompt, image_bytes)
@@ -447,13 +468,17 @@ def _estimate_monocular_thickness(
             return None
 
         ref_dim = min(measurement_width_mm, measurement_height_mm) if measurement_height_mm > 0 else measurement_width_mm
-        thickness_mm = ratio * ref_dim * settings.depth_width_scale
+        thickness_mm = ratio * ref_dim
         thickness_mm = max(0.5, min(50.0, thickness_mm))
+
+        confidence = 0.25
+        if thickness_mm < 1.0 and ref_dim > 10.0:
+            confidence = 0.10
 
         return ThicknessResult(
             thickness_mm=round(thickness_mm, 2),
             method=ThicknessMethod.VISION_ESTIMATE,
-            confidence=0.35,
+            confidence=confidence,
             depth_map_used=True,
             num_views_used=1,
         )

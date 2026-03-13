@@ -22,7 +22,8 @@ DIFF_BLUR_KSIZE = 7
 MORPH_KERNEL_SIZE = 7
 MIN_DAMAGE_AREA_RATIO = 0.0005
 MAX_DAMAGE_AREA_RATIO = 0.5
-MATCHING_RESOLUTION = 1200
+MATCHING_RESOLUTION = 2400
+RANSAC_REPROJ_THRESH = 3.0
 
 
 @dataclass
@@ -95,9 +96,12 @@ def _try_detector(
 ) -> tuple[list, list, list] | None:
     """Try a specific feature detector. Returns (kp1, kp2, good_matches) or None."""
     try:
-        if detector_name == "ORB":
+        if detector_name == "SIFT":
+            det = cv2.SIFT_create(nfeatures=15000, contrastThreshold=0.025)
+            norm = cv2.NORM_L2
+        elif detector_name == "ORB":
             det = cv2.ORB_create(
-                nfeatures=10000,
+                nfeatures=12000,
                 scaleFactor=1.2,
                 nLevels=16,
                 edgeThreshold=15,
@@ -106,11 +110,8 @@ def _try_detector(
             )
             norm = cv2.NORM_HAMMING
         elif detector_name == "AKAZE":
-            det = cv2.AKAZE_create(threshold=0.001)
+            det = cv2.AKAZE_create(threshold=0.0008)
             norm = cv2.NORM_HAMMING
-        elif detector_name == "SIFT":
-            det = cv2.SIFT_create(nfeatures=8000, contrastThreshold=0.03)
-            norm = cv2.NORM_L2
         else:
             return None
     except Exception:
@@ -125,12 +126,12 @@ def _try_detector(
         return None
 
     if norm == cv2.NORM_L2:
-        index_params = dict(algorithm=1, trees=5)
-        search_params = dict(checks=50)
+        index_params = dict(algorithm=1, trees=8)
+        search_params = dict(checks=100)
         matcher = cv2.FlannBasedMatcher(index_params, search_params)
     else:
-        index_params = dict(algorithm=6, table_number=6, key_size=12, multi_probe_level=1)
-        search_params = dict(checks=50)
+        index_params = dict(algorithm=6, table_number=12, key_size=20, multi_probe_level=2)
+        search_params = dict(checks=100)
         try:
             matcher = cv2.FlannBasedMatcher(index_params, search_params)
         except Exception:
@@ -166,10 +167,11 @@ def _detect_and_match(
 ) -> tuple[list, list, list]:
     """Detect features and match between before/after images.
 
-    Tries multiple detectors (ORB -> AKAZE -> SIFT) on both raw and
-    CLAHE-enhanced images for maximum robustness.
+    Tries multiple detectors (SIFT -> AKAZE -> ORB) on both raw and
+    CLAHE-enhanced images for maximum robustness. SIFT is tried first
+    because it handles scale/viewpoint changes best.
     """
-    detectors = ["ORB", "AKAZE", "SIFT"]
+    detectors = ["SIFT", "AKAZE", "ORB"]
 
     for enhanced in [False, True]:
         bg = _enhance_for_matching(before_gray) if enhanced else before_gray
@@ -245,7 +247,10 @@ def _align_images(
     inlier_count = 0
     method_used = "homography"
 
-    H, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    homography_method = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)
+    H, inlier_mask = cv2.findHomography(
+        src_pts, dst_pts, homography_method, RANSAC_REPROJ_THRESH,
+    )
 
     if H is not None:
         cond = np.linalg.cond(H)
@@ -254,14 +259,17 @@ def _align_images(
             confidence = inlier_count / len(good) if len(good) > 0 else 0.0
             if confidence >= 0.2:
                 aligned_up = cv2.warpPerspective(before_match, H, (w_up, h_up))
-                method_used = "homography"
+                method_used = "homography (MAGSAC)" if homography_method != cv2.RANSAC else "homography"
             else:
                 logger.info("Homography confidence too low (%.1f%%), trying affine...", confidence * 100)
         else:
             logger.info("Homography degenerate (cond=%.0f), trying affine...", cond)
 
     if aligned_up is None and len(good) >= 3:
-        M, inlier_mask_aff = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+        M, inlier_mask_aff = cv2.estimateAffinePartial2D(
+            src_pts, dst_pts, method=cv2.RANSAC,
+            ransacReprojThreshold=RANSAC_REPROJ_THRESH,
+        )
         if M is not None:
             inlier_count = int(inlier_mask_aff.sum()) if inlier_mask_aff is not None else 0
             aligned_up = cv2.warpAffine(before_match, M, (w_up, h_up))
@@ -316,10 +324,11 @@ def _compute_diff_mask(
 
     _, binary = cv2.threshold(combined, threshold, 255, cv2.THRESH_BINARY)
 
-    # Also try Otsu for robustness — use the one that produces a more reasonable mask
     _, otsu_binary = cv2.threshold(combined, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     img_area = binary.shape[0] * binary.shape[1]
+    if img_area == 0:
+        raise SegmentationError("Empty image — cannot compute difference mask.")
     fixed_ratio = np.sum(binary > 0) / img_area
     otsu_ratio = np.sum(otsu_binary > 0) / img_area
 
@@ -401,21 +410,23 @@ def _postprocess_mask(mask: np.ndarray) -> np.ndarray:
             perimeter = cv2.arcLength(comp_contours[0], True)
         else:
             perimeter = 0.0
-        compactness = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
+        raw_compactness = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
+        compactness = raw_compactness * min(area_ratio / 0.005, 1.0)
 
         edge_penalty = 1.0 - 0.3 * edge_count
 
         score = (
             0.3 * centrality
             + 0.3 * compactness
-            + 0.2 * min(area_ratio / 0.1, 1.0)
+            + 0.2 * min(area_ratio / 0.02, 1.0)
             + 0.2 * edge_penalty
         )
 
         logger.debug(
-            "Component %d: area=%.4f centrality=%.2f compact=%.2f "
+            "Component %d: area=%.4f centrality=%.2f compact=%.2f(raw=%.2f) "
             "edges=%d score=%.3f",
-            label_id, area_ratio, centrality, compactness, edge_count, score,
+            label_id, area_ratio, centrality, compactness, raw_compactness,
+            edge_count, score,
         )
 
         if score > best_score:

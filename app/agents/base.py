@@ -73,11 +73,15 @@ class Agent:
 
             parsed = parse_json_response(text)
 
+            raw_suggestions = parsed.get("suggestions", [])
+            if isinstance(raw_suggestions, str):
+                raw_suggestions = [raw_suggestions] if raw_suggestions else []
+
             return AgentResult(
                 success=parsed.get("should_proceed", True),
                 data=context,
                 reasoning=parsed.get("reasoning", ""),
-                suggestions=parsed.get("suggestions", []),
+                suggestions=raw_suggestions,
                 confidence=parsed.get("confidence", context.get("confidence", 1.0)),
             )
 
@@ -117,11 +121,15 @@ class Agent:
 
             parsed = parse_json_response(text)
 
+            raw_suggestions = parsed.get("suggestions", [])
+            if isinstance(raw_suggestions, str):
+                raw_suggestions = [raw_suggestions] if raw_suggestions else []
+
             return AgentResult(
                 success=parsed.get("should_proceed", True),
                 data=context,
                 reasoning=parsed.get("reasoning", ""),
-                suggestions=parsed.get("suggestions", []),
+                suggestions=raw_suggestions,
                 confidence=parsed.get("confidence", context.get("confidence", 1.0)),
             )
 
@@ -144,9 +152,9 @@ class Agent:
         return (
             f"You are the {self.name} agent in a photo-to-3D-print repair pipeline.\n\n"
             f"Stage results:\n{json.dumps(sanitized, indent=2, default=str)}\n\n"
-            "Analyze these results. Respond with JSON containing:\n"
+            "Analyze these results. Respond with a JSON object containing:\n"
             '- "reasoning": your analysis of the results (1-3 sentences)\n'
-            '- "suggestions": list of actionable suggestions for the user (0-3 items)\n'
+            '- "suggestions": array of actionable suggestions for the user (0-3 items)\n'
             '- "confidence": your confidence in the results (0.0-1.0)\n'
             '- "should_proceed": whether the pipeline should continue (true/false)\n'
         )

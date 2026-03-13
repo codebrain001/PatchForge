@@ -14,13 +14,17 @@ from app.models.job import CalibrationResult
 logger = logging.getLogger("patchforge.agents.calibration")
 
 ROLE = (
-    "You are the calibration decision engine in a photo-to-3D-print repair pipeline. "
-    "Multiple calibration strategies have been run — HEIF depth extraction, ArUco marker "
-    "detection, WebXR AR measurement, and/or user reference line. Each produced an "
-    "independent scale estimate (mm per pixel). YOUR JOB is to decide which estimate "
-    "to trust, whether to blend multiple estimates, and what the final authoritative "
-    "scale factor should be. You understand camera optics, ArUco marker geometry, "
-    "LiDAR depth sensing, and measurement uncertainty. You MUST pick one final answer."
+    "You are the calibration decision engine in a photo-to-3D-print patch pipeline. "
+    "The target printer is a Bambu Lab A1 (build volume: 256 x 256 x 256 mm). "
+    "Calibration determines the mm-per-pixel scale so we can convert the gap/void "
+    "dimensions from pixels to real-world mm for the replacement patch. "
+    "Multiple calibration strategies may produce independent scale estimates: "
+    "HEIF depth extraction, ArUco marker detection, WebXR AR measurement, and/or "
+    "user reference line. YOUR JOB is to decide which estimate to trust, whether "
+    "to blend them, and what the final authoritative scale factor should be. "
+    "A physically plausible scale is typically 0.01-1.0 mm/px for phone photos. "
+    "Values outside 0.001-10 mm/px are almost certainly wrong. "
+    "You MUST pick one final answer."
 )
 
 CONSENSUS_SCHEMA = {
@@ -136,7 +140,7 @@ class CalibrationAgent(Agent):
             prompt += "The strategies DISAGREE. You must choose which to trust and explain why.\n"
 
         prompt += (
-            "\nYour decision:\n"
+            "\nRespond with a JSON object containing your decision:\n"
             '- "chosen_method": which method to trust (or "blended" if averaging)\n'
             '- "final_scale_factor": the authoritative mm-per-pixel value\n'
             '- "confidence": your confidence in this decision (0.0-1.0)\n'
@@ -190,11 +194,15 @@ class CalibrationAgent(Agent):
                     depth_map_available=chosen_result.depth_map_available,
                 )
 
+            raw_suggestions = parsed.get("suggestions", [])
+            if isinstance(raw_suggestions, str):
+                raw_suggestions = [raw_suggestions] if raw_suggestions else []
+
             analysis = AgentResult(
                 success=parsed.get("should_proceed", True),
                 data={"candidates": [self._result_to_dict(r) for r in results], "chosen": chosen_method},
                 reasoning=parsed.get("reasoning", ""),
-                suggestions=parsed.get("suggestions", []),
+                suggestions=raw_suggestions,
                 confidence=confidence,
             )
 

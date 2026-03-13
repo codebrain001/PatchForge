@@ -23,7 +23,7 @@ from app.agents.printer_agent import PrinterAgent
 from app.agents.segmentation_agent import SegmentationAgent
 from app.agents.thickness_agent import ThicknessAgent
 from app.agents.validation_agent import ValidationAgent
-from app.core.storage import job_mask_path, job_mesh_path, job_propagated_masks_dir
+from app.core.storage import job_mask_path, job_mesh_path, job_propagated_masks_dir, job_viz_path
 from app.models.job import (
     Job, JobStatus, ReasoningEntry, ThicknessMethod, ThicknessResult,
     UploadType, DetectionMode, CalibrationResult,
@@ -34,7 +34,79 @@ from app.core.job_store import get_job, store_job
 logger = logging.getLogger("patchforge.orchestrator")
 
 
-ProgressCallback = Callable[[str, JobStatus], None]
+# Rich event callback: receives (job_id, message_dict).
+# Message dicts have a "type" key — "status", "reasoning", or "viz".
+EventCallback = Callable[[str, dict], None]
+
+# Authoritative coin diameter / across-flats lookup (mm).
+# Used by both vision prompts and by the self-consistency validator.
+_COIN_SIZES: dict[str, float] = {
+    "us quarter": 24.26,
+    "us penny": 19.05,
+    "us nickel": 21.21,
+    "us dime": 17.91,
+    "euro 1€": 23.25,
+    "euro 1 euro": 23.25,
+    "euro 2€": 25.75,
+    "euro 2 euro": 25.75,
+    "euro 50c": 24.25,
+    "euro 20c": 22.25,
+    "uk £1": 23.43,
+    "uk 1 pound": 23.43,
+    "uk £2": 28.4,
+    "uk 2 pound": 28.4,
+    "uk 50p": 27.3,
+    "uk 50 pence": 27.3,
+    "50 pence": 27.3,
+    "50p": 27.3,
+    "uk 20p": 21.4,
+    "uk 20 pence": 21.4,
+    "uk 10p": 24.5,
+    "uk 10 pence": 24.5,
+    "uk 5p": 18.0,
+    "uk 5 pence": 18.0,
+    "uk 2p": 25.9,
+    "uk 2 pence": 25.9,
+    "uk 1p": 20.3,
+    "uk 1 penny": 20.3,
+    "zar r5": 26.0,
+    "zar r2": 23.0,
+    "zar r1": 20.0,
+    "zar 50c": 22.0,
+}
+
+# Formatted string for use in LLM prompts
+_COIN_LIST_PROMPT = (
+    "DEFAULT: The coin in this image is most likely a UK £2 coin (28.4mm diameter, "
+    "bimetallic — gold center with silver rim). Use 28.4mm unless the coin is clearly "
+    "a different type.\n"
+    "    Other coins for reference: "
+    "UK £1=23.43mm (thin, gold, round), UK 50p=27.3mm (silver, heptagonal/7-sided), "
+    "UK 20p=21.4mm, UK 10p=24.5mm, UK 5p=18mm, UK 2p=25.9mm, UK 1p=20.3mm, "
+    "US quarter=24.26mm, US penny=19.05mm, US nickel=21.21mm, US dime=17.91mm, "
+    "Euro 1€=23.25mm, Euro 2€=25.75mm, Euro 50c=24.25mm, "
+    "ZAR R5=26mm, ZAR R2=23mm, ZAR R1=20mm, ZAR 50c=22mm"
+)
+
+
+_DEFAULT_COIN_SIZE_MM = 28.4  # UK £2 coin — default for this demo
+
+
+def _lookup_coin_size(ref_name: str) -> float:
+    """Fuzzy-match a reference_object string against known coin sizes.
+
+    Falls back to UK £2 (28.4 mm) when no match is found.
+    """
+    if not ref_name:
+        return _DEFAULT_COIN_SIZE_MM
+    name = ref_name.lower().strip()
+    if name in _COIN_SIZES:
+        return _COIN_SIZES[name]
+    for key, size in _COIN_SIZES.items():
+        if key in name or name in key:
+            return size
+    logger.info("Coin '%s' not recognized — defaulting to UK £2 (28.4 mm)", ref_name)
+    return _DEFAULT_COIN_SIZE_MM
 
 # Singleton agents
 _cal_agent = CalibrationAgent()
@@ -57,32 +129,39 @@ async def _vision_calibration_fallback(
     try:
         max_dim = 800
         img = image_bgr
+        resize_factor = 1.0
         if max(h_img, w_img) > max_dim:
-            s = max_dim / max(h_img, w_img)
-            img = cv2.resize(img, (int(w_img * s), int(h_img * s)))
+            resize_factor = max_dim / max(h_img, w_img)
+            img = cv2.resize(img, (int(w_img * resize_factor), int(h_img * resize_factor)))
 
+        disp_h, disp_w = img.shape[:2]
         _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
         image_bytes = buf.tobytes()
 
         system = (
-            "You are a calibration expert. Analyze images to identify objects of known "
-            "real-world size so we can compute a mm-per-pixel scale factor."
+            "You are a calibration expert for a photo-to-3D-print repair pipeline. "
+            "You identify objects of known real-world size in images and compute "
+            "a mm-per-pixel scale factor from them."
         )
         prompt = (
-            f"This image is {w_img}x{h_img} pixels. I need to determine the real-world "
-            "scale (mm per pixel). There is no calibration marker.\n\n"
-            "Look for ANY objects in the image whose real-world size you can estimate:\n"
-            "- Fingers/hand (index finger ~17mm wide)\n"
-            "- Coins, USB ports, screws, pens, credit cards\n"
-            "- Standard brick, tile, keyboard keys\n"
-            "- The broken object itself if you can identify what it is\n\n"
-            "Estimate how many pixels wide that known object appears in the image, "
-            "then compute mm_per_pixel = known_mm / pixel_width.\n\n"
-            "Respond with ONLY JSON:\n"
-            '{"reference_object": "<what you identified>", '
+            f"This image is {disp_w}x{disp_h} pixels. I need to determine the "
+            "real-world scale (mm per pixel). There is no calibration marker.\n\n"
+            "Identify ANY object in the image whose real-world size you know:\n"
+            f"- Coins: {_COIN_LIST_PROMPT}\n"
+            "- Fingers/hand (index finger width ~17mm, thumb ~20mm)\n"
+            "- Credit card: 85.6mm x 54mm\n"
+            "- USB-A port: 12mm wide, USB-C port: 8.25mm wide\n"
+            "- Standard keyboard key: ~15mm\n\n"
+            "DEFAULT: Assume the coin is a UK 2 pound coin (28.4mm) unless it is "
+            "clearly something else. A UK £2 is bimetallic (gold center, silver rim). "
+            "A UK £1 is smaller, thin, and all gold. Do not confuse them.\n\n"
+            "Measure how many pixels wide that object appears in THIS image, "
+            "then compute: mm_per_pixel = known_mm / pixel_width.\n\n"
+            "Respond with ONLY a JSON object:\n"
+            '{"reference_object": "<exact object name>", '
             '"reference_size_mm": <real-world width in mm>, '
-            '"reference_size_px": <pixel width in image>, '
-            '"mm_per_pixel": <computed scale>, '
+            '"reference_size_px": <pixel width as measured in this image>, '
+            '"mm_per_pixel": <computed scale = reference_size_mm / reference_size_px>, '
             '"confidence": <0.0-1.0>}'
         )
 
@@ -92,21 +171,52 @@ async def _vision_calibration_fallback(
         logger.info("Vision calibration via %s", provider)
 
         parsed = parse_json_response(text)
-        scale = float(parsed.get("mm_per_pixel", 0))
+        mm_per_px = float(parsed.get("mm_per_pixel", 0))
         confidence = float(parsed.get("confidence", 0))
         ref_obj = parsed.get("reference_object", "unknown")
 
-        if scale > 0.001 and confidence >= 0.3:
+        if mm_per_px > 0.001 and confidence >= 0.3:
+            original_mm_per_px = mm_per_px * resize_factor
             logger.info(
-                "Vision calibration: %.5f mm/px from %s (conf=%.2f)",
-                scale, ref_obj, confidence,
+                "Vision calibration: %.5f mm/px (display) -> %.5f mm/px (original) from %s (conf=%.2f)",
+                mm_per_px, original_mm_per_px, ref_obj, confidence,
             )
-            return scale
+            return original_mm_per_px
 
     except Exception as e:
         logger.warning("Vision calibration fallback failed: %s", e)
 
     return None
+
+
+def _generate_negative_points(
+    cx: int, cy: int, w: int, h: int,
+) -> list[dict]:
+    """Generate negative SAM 2 point prompts on intact surfaces around the damage.
+
+    Places points at ~20% of image dimension offset from the positive click
+    in the four cardinal directions, clamped to image bounds with a margin.
+    These tell SAM 2 "do NOT include these areas in the mask," preventing
+    it from segmenting the entire object when clicked on a gap.
+    """
+    margin = 20
+    offset_x = max(int(w * 0.15), 80)
+    offset_y = max(int(h * 0.15), 80)
+
+    candidates = [
+        (cx - offset_x, cy),
+        (cx + offset_x, cy),
+        (cx, cy - offset_y),
+        (cx, cy + offset_y),
+    ]
+
+    points = []
+    for nx, ny in candidates:
+        nx = max(margin, min(nx, w - margin))
+        ny = max(margin, min(ny, h - margin))
+        if abs(nx - cx) > 30 or abs(ny - cy) > 30:
+            points.append({"x": nx, "y": ny, "label": 0})
+    return points
 
 
 async def _vision_locate_damage(
@@ -131,22 +241,29 @@ async def _vision_locate_damage(
         _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
         image_bytes = buf.tobytes()
 
+        disp_h, disp_w = img.shape[:2]
+
         system = (
             "You are a computer vision expert specializing in damage detection "
-            "for 3D-printable repair parts."
+            "for 3D-printable repair patches."
         )
         prompt = (
-            f"This image is {w_img}x{h_img} pixels. It shows a broken or damaged "
-            "object — a piece has been broken off or is missing.\n\n"
-            "Find the broken/missing area and return the PIXEL coordinates of "
-            "its approximate center. Look for:\n"
-            "- A gap, void, or missing chunk in the object\n"
-            "- A visible break line or crack\n"
-            "- An area where material is clearly absent\n\n"
-            "Respond with ONLY JSON:\n"
-            '{"x": <pixel x coordinate of damage center>, '
-            '"y": <pixel y coordinate of damage center>, '
-            '"description": "<brief description of the damage>", '
+            f"This image is {disp_w}x{disp_h} pixels. It shows an object that has "
+            "a piece broken off or missing. We need to find WHERE the missing piece "
+            "was, so we can 3D-print a replacement patch to fill the gap.\n\n"
+            "Find the GAP/VOID where material is missing (NOT the whole object) and "
+            "return the PIXEL coordinates of the center of that gap. Look for:\n"
+            "- A gap, void, or missing chunk where a piece broke off\n"
+            "- A visible break line, fracture, or crack edge\n"
+            "- An area where material is clearly absent compared to the rest\n\n"
+            "IMPORTANT: Point to the CENTER of the missing area, not the center "
+            "of the whole object.\n\n"
+            "Coordinates must be within the image bounds "
+            f"(0 <= x < {disp_w}, 0 <= y < {disp_h}).\n\n"
+            "Respond with ONLY a JSON object:\n"
+            '{"x": <pixel x of gap center>, '
+            '"y": <pixel y of gap center>, '
+            '"description": "<describe what is missing and where>", '
             '"confidence": <0.0-1.0>}'
         )
 
@@ -213,68 +330,79 @@ async def _vision_measure_damage(
         system = (
             "You are a precision measurement expert for 3D-printable repair parts. "
             "The target printer is a Bambu Lab A1 (build volume: 256 x 256 x 256 mm). "
-            "You can estimate real-world dimensions from photos by comparing to "
-            "objects of known size."
+            "You measure real-world dimensions from photos using proportional reasoning "
+            "against objects of known size. You always report pixel measurements so your "
+            "work can be verified."
         )
         prompt = (
-            "This image shows a broken/damaged object. A piece has been broken off "
-            "and we need to 3D-print a replacement patch that fits into the gap.\n\n"
-            "YOUR TASK: Measure the FULL EXTENT of the missing piece — imagine the "
-            "piece that broke off and was removed. You are measuring that missing "
-            "piece so we can print a replacement. Include the ENTIRE break area "
-            "from edge to edge of the damage, not just the deepest notch.\n\n"
-            "STEP 1 — Find a reference object for scale:\n"
-            "  * Coins: US quarter=24.26mm, US penny=19.05mm, Euro 1€=23.25mm, "
-            "Euro 2€=25.75mm, UK £1=23.43mm, UK £2=28.4mm, "
-            "ZAR R5=26mm, ZAR R2=23mm, ZAR R1=20mm, ZAR 50c=22mm\n"
+            "This image shows an object with a piece broken off. We need to "
+            "3D-print a PATCH that fits into the gap left by the missing piece.\n\n"
+            "YOUR TASK: Measure the GAP/VOID — the space where the missing piece "
+            "used to be. You are measuring the PATCH dimensions, NOT the whole "
+            "object. The patch must fill the break from edge to edge.\n\n"
+            "STEP 1 — Identify the reference object for scale:\n"
+            f"  * Coins: {_COIN_LIST_PROMPT}\n"
             "  * Fingers: adult index finger width ~17mm, thumb ~20mm\n"
-            "  * Credit card: 85.6mm x 54mm\n\n"
-            "STEP 2 — Proportional reasoning (MANDATORY — do this exactly):\n"
-            "  a) Estimate the coin/reference DIAMETER in pixels in the image\n"
-            "  b) Estimate the break WIDTH in pixels in the image\n"
-            "  c) Estimate the break HEIGHT in pixels in the image\n"
-            "  d) Compute: width_mm = coin_mm * (break_width_px / coin_px)\n"
-            "  e) Compute: height_mm = coin_mm * (break_height_px / coin_px)\n\n"
+            "  * Credit card: 85.6mm x 54mm\n"
+            "  DEFAULT: Assume the coin is a UK 2 pound coin (28.4mm) unless it is "
+            "clearly something else. A UK £2 is bimetallic (gold center, silver rim). "
+            "A UK £1 is smaller, thin, and all gold. A UK 50p is silver and heptagonal "
+            "(7-sided). Do NOT confuse them.\n\n"
+            "STEP 2 — Pixel measurement (MANDATORY — do this FIRST, before mm):\n"
+            "  a) Measure the reference object's DIAMETER/WIDTH in pixels (ref_px)\n"
+            "  b) Measure the break's WIDTH in pixels (break_width_px) — the shorter\n"
+            "     horizontal extent of the ACTUAL gap opening only\n"
+            "  c) Measure the break's HEIGHT in pixels (break_height_px) — the longer\n"
+            "     vertical extent of the ACTUAL gap opening only\n\n"
+            "  NOTE: Width and height are independent measurements. A rectangular break\n"
+            "  will have DIFFERENT width and height values. Do NOT assume they are equal.\n\n"
+            "STEP 3 — Convert to mm (MANDATORY formula — show your work):\n"
+            "  ref_mm = known diameter of the reference object in mm\n"
+            "  width_mm = ref_mm * (break_width_px / ref_px)\n"
+            "  height_mm = ref_mm * (break_height_px / ref_px)\n"
+            "  The values you return for width_mm and height_mm MUST equal these\n"
+            "  computed values. Do NOT round, adjust, or apply margins.\n\n"
             "  WORKED EXAMPLE:\n"
-            "    Coin: Euro 1€ (23mm), appears ~100px wide in image\n"
-            "    Break: appears ~65px wide, ~130px tall\n"
-            "    width = 23 * (65/100) = 14.95mm ≈ 15mm\n"
-            "    height = 23 * (130/100) = 29.9mm ≈ 30mm\n\n"
-            "  COMMON MISTAKE: Do NOT underestimate the pixel sizes. Measure from "
-            "the outermost edges of the break, including the full gap.\n\n"
-            "STEP 3 — Measure the missing piece:\n"
-            "  * width_mm = FULL width from outermost edge to outermost edge\n"
-            "  * height_mm = FULL height from outermost edge to outermost edge\n"
-            "  * Add 10%% margin — too big can be sanded, too small won't fit\n\n"
-            "STEP 4 — Estimate thickness (CRITICAL — follow this carefully):\n"
-            "  Option A (preferred): If the break EDGE is visible (you can see the wall\n"
-            "  cross-section at the fracture), measure it with proportional reasoning:\n"
-            "    * Estimate the edge/wall thickness in pixels\n"
-            "    * thickness_mm = coin_mm * (edge_thickness_px / coin_px)\n"
-            "  Option B: If the break edge is NOT visible (top-down only), infer from\n"
-            "  the object type and proportions:\n"
-            "    * 3D-printed plastic walls: typically 2-4mm\n"
-            "    * Injection-molded plastic: typically 1.5-3mm\n"
-            "    * Ceramic/porcelain: typically 3-8mm\n"
-            "    * General rule: thickness ≈ width / 5 to width / 3\n"
-            "  * Report which option you used in thickness_reasoning\n\n"
-            "STEP 5 — Visual cross-check (MANDATORY):\n"
-            "  * Visually compare the break to the coin side-by-side\n"
-            "  * If the break appears WIDER than the coin, width MUST be > coin diameter\n"
-            "  * If the break appears TALLER than the coin, height MUST be > coin diameter\n"
-            "  * If the break is roughly 2/3 the coin width, measurement ≈ 2/3 of coin diameter\n"
-            "  * If your measurements violate these visual checks, redo the calculation\n\n"
-            "Respond with ONLY JSON:\n"
-            '{"width_mm": <number>, '
-            '"height_mm": <number>, '
-            '"thickness_mm": <number>, '
-            '"reference_object": "<what you identified>", '
-            '"ref_px": <reference object width in pixels>, '
+            "    Coin: UK 2 pound (28.4mm), appears ~100px wide in image\n"
+            "    Break: appears ~53px wide, ~106px tall\n"
+            "    width_mm = 28.4 * (53/100) = 15.05\n"
+            "    height_mm = 28.4 * (106/100) = 30.10\n\n"
+            "STEP 4 — Estimate thickness (the DEPTH/WALL-THICKNESS of the break):\n"
+            "  Thickness = how thick the WALL or SHELL was where it broke off. This\n"
+            "  is the Z-depth of the patch — how far it protrudes from the surface.\n"
+            "  Think of it as the distance from the front face to the back face of\n"
+            "  the broken wall.\n\n"
+            "  Option A (preferred): Look at the FRACTURE EDGE — the exposed broken\n"
+            "  cross-section of the wall. Measure the NARROW dimension of that edge\n"
+            "  (the wall depth), NOT the gap opening width. For example, if you see\n"
+            "  a broken rim or ledge, measure from the outer surface to the inner\n"
+            "  surface of that rim.\n"
+            "    edge_thickness_px = <wall cross-section depth in pixels>\n"
+            "    thickness_mm = ref_mm * (edge_thickness_px / ref_px)\n"
+            "  NOTE: It is possible for thickness to be close to the width or height\n"
+            "  if the object has thick walls. This is valid. Just make sure you are\n"
+            "  measuring the wall cross-section, not re-measuring the gap opening.\n"
+            "  Option B: If the edge cross-section is NOT visible, look for depth cues\n"
+            "  (shadows, perspective, visible ledges). If you truly CANNOT measure\n"
+            "  thickness, set thickness_mm to 0 and confidence below 0.3.\n"
+            "  Do NOT guess thickness from material type or generic assumptions.\n\n"
+            "STEP 5 — Visual sanity check:\n"
+            "  Compare break dimensions to the reference object visually.\n"
+            "  If the break is SMALLER than the coin, both dimensions MUST be < coin diameter.\n"
+            "  If the break is LARGER than the coin, both dimensions MUST be > coin diameter.\n"
+            "  If your mm values violate this, your pixel measurements are wrong — redo them.\n\n"
+            "Respond with ONLY a JSON object:\n"
+            '{"width_mm": <number from Step 3 formula>, '
+            '"height_mm": <number from Step 3 formula>, '
+            '"thickness_mm": <number from Step 4 formula or 0>, '
+            '"reference_object": "<exact coin/object name and its known mm size>", '
+            '"ref_px": <reference diameter in pixels>, '
             '"break_width_px": <break width in pixels>, '
             '"break_height_px": <break height in pixels>, '
-            '"reasoning": "<show coin_mm * (break_px / coin_px) calculation>", '
-            '"thickness_reasoning": "<explain how thickness was estimated: Option A or B, show calculation>", '
-            '"description": "<describe the break shape>", '
+            '"edge_thickness_px": <edge thickness in pixels if Option A, else 0>, '
+            '"reasoning": "<show ref_mm * (break_px / ref_px) calculation for width and height>", '
+            '"thickness_reasoning": "<Option A or B, show calculation if A>", '
+            '"description": "<describe the break shape — rectangular, triangular, etc.>", '
             '"confidence": <0.0-1.0>}'
         )
 
@@ -303,6 +431,74 @@ async def _vision_measure_damage(
         )
         if thickness_reasoning:
             logger.info("Vision thickness reasoning: %s", thickness_reasoning)
+
+        edge_t_px = parsed.get("edge_thickness_px", 0)
+
+        # --- Self-consistency validation ---
+        # Recompute dimensions from the pixel fields the LLM itself reported.
+        # If the returned mm values diverge >30% from the recomputed values,
+        # the LLM contradicted its own reasoning — use the recomputed values.
+        try:
+            _ref_px = float(ref_px) if ref_px else 0
+            _break_w = float(break_w_px) if break_w_px else 0
+            _break_h = float(break_h_px) if break_h_px else 0
+            _edge_t = float(edge_t_px) if edge_t_px else 0
+        except (TypeError, ValueError):
+            _ref_px = _break_w = _break_h = _edge_t = 0
+
+        if _ref_px > 0 and _break_w > 0 and _break_h > 0:
+            ref_size_mm = _lookup_coin_size(ref)
+            recomputed_w = ref_size_mm * (_break_w / _ref_px)
+            recomputed_h = ref_size_mm * (_break_h / _ref_px)
+
+            if recomputed_w > 0 and abs(width - recomputed_w) / recomputed_w > 0.3:
+                logger.warning(
+                    "Vision self-contradiction: returned w=%.1f but pixel data gives %.1f — using recomputed",
+                    width, recomputed_w,
+                )
+                width = recomputed_w
+
+            if recomputed_h > 0 and abs(height - recomputed_h) / recomputed_h > 0.3:
+                logger.warning(
+                    "Vision self-contradiction: returned h=%.1f but pixel data gives %.1f — using recomputed",
+                    height, recomputed_h,
+                )
+                height = recomputed_h
+
+            # Thickness self-consistency (Option A: edge measured in pixels)
+            if _edge_t > 0:
+                recomputed_t = ref_size_mm * (_edge_t / _ref_px)
+
+                if _break_w > 0 and _break_h > 0 and _edge_t == _break_w == _break_h:
+                    logger.warning(
+                        "edge_thickness_px (%.0f) equals BOTH break width(%.0f) "
+                        "and height(%.0f) — LLM returned identical values for "
+                        "all dimensions, discarding thickness",
+                        _edge_t, _break_w, _break_h,
+                    )
+                    thickness = 0
+                elif _edge_t == _break_w or _edge_t == _break_h:
+                    logger.warning(
+                        "edge_thickness_px (%.0f) matches one gap dimension "
+                        "(w=%.0f, h=%.0f) — LLM may have re-measured width/height "
+                        "as thickness, halving confidence",
+                        _edge_t, _break_w, _break_h,
+                    )
+                    thickness = recomputed_t if recomputed_t > 0 else thickness
+                    conf *= 0.5
+                elif recomputed_t > 0 and thickness > 0:
+                    if abs(thickness - recomputed_t) / max(recomputed_t, 0.1) > 0.3:
+                        logger.warning(
+                            "Vision thickness self-contradiction: returned t=%.1f but pixel data gives %.1f — using recomputed",
+                            thickness, recomputed_t,
+                        )
+                        thickness = recomputed_t
+                elif recomputed_t > 0 and thickness <= 0:
+                    logger.info(
+                        "Vision thickness recomputed from edge_thickness_px: %.1f mm",
+                        recomputed_t,
+                    )
+                    thickness = recomputed_t
 
         if width <= 0 or height <= 0 or conf < 0.3:
             logger.warning(
@@ -357,23 +553,27 @@ async def _vision_get_break_polygon(
         image_bytes = buf.tobytes()
 
         system = (
-            "You are a precise computer vision expert. You can identify break "
-            "boundaries in images and trace their outlines as polygon coordinates."
+            "You are a precise computer vision expert. You trace the outline of "
+            "missing/broken areas in images so a replacement patch can be 3D-printed."
         )
         prompt = (
-            f"This image is {disp_w}x{disp_h} pixels. It shows a broken object "
-            "where a piece has been broken off.\n\n"
-            "TASK: Trace the OUTLINE of the missing/broken area as a polygon.\n"
-            "Return the corner points of the break boundary in PIXEL coordinates.\n\n"
+            f"This image is {disp_w}x{disp_h} pixels. It shows an object with a "
+            "piece broken off — there is a visible gap/void where material is missing.\n\n"
+            "TASK: Trace the OUTLINE of the GAP (the missing piece area) as a polygon.\n"
+            "The polygon defines the shape of the PATCH we will 3D-print to fill the gap.\n"
+            "Return the corner points in PIXEL coordinates.\n\n"
+            "IMPORTANT — PREFER RECTANGLES:\n"
+            "Most broken pieces leave a roughly rectangular gap. If the gap is even\n"
+            "approximately rectangular, return EXACTLY 4 corner points forming a clean\n"
+            "rectangle (top-left, top-right, bottom-right, bottom-left). Do NOT add\n"
+            "extra points for minor edge irregularities — the 3D printer needs a\n"
+            "clean shape, not a pixel-perfect trace of jagged fracture edges.\n"
+            "Only use more than 4 points if the gap is genuinely triangular or has a\n"
+            "clearly non-rectangular shape (e.g. an L-shape with a distinct step).\n\n"
             "RULES:\n"
-            "- Trace ONLY the break/gap boundary, not the whole object\n"
-            "- Follow the break edges — where material was removed\n"
-            "- Include the straight edges of the original object that border the gap\n"
-            "- Use 4-8 points that define the break shape\n"
-            "- For a rectangular break: 4 corners\n"
-            "- For a triangular break (corner chip): 3-4 points\n"
-            "- For an irregular break: 5-8 points following the edge\n"
-            "- Points should go clockwise around the break boundary\n"
+            "- Trace ONLY the gap/void boundary — NOT the outline of the whole object\n"
+            "- Use the FEWEST points that capture the gap shape (4 for rectangles)\n"
+            "- Points should go clockwise around the gap boundary\n"
             "- Coordinates must be within the image bounds\n\n"
             "Respond with ONLY JSON:\n"
             '{"points": [[x1,y1], [x2,y2], ...], '
@@ -445,7 +645,7 @@ async def run_analysis(
     ref_line_end: Optional[list[int]] = None,
     ref_line_mm: Optional[float] = None,
     webxr_scale: Optional[float] = None,
-    on_progress: Optional[ProgressCallback] = None,
+    on_progress: Optional[EventCallback] = None,
 ) -> Job:
     """Run Calibration -> Segmentation -> Measurement -> Thickness agents."""
 
@@ -453,7 +653,16 @@ async def run_analysis(
         job.status = status
         store_job(job)
         if on_progress:
-            on_progress(job.id, status)
+            on_progress(job.id, {"type": "status", "status": status.value})
+
+    def _emit(event: dict):
+        if on_progress:
+            on_progress(job.id, event)
+
+    def _log_and_emit(agent_name: str, stage: str, result):
+        _log_reasoning(job, agent_name, stage, result)
+        entry = job.reasoning_log[-1]
+        _emit({"type": "reasoning", "entry": entry.model_dump()})
 
     job.reasoning_log = []
 
@@ -472,7 +681,6 @@ async def run_analysis(
                 webxr_scale=webxr_scale,
             )
 
-            # If the consensus returned no usable result, try vision fallback
             if cal_result.scale_factor <= 0 or cal_result.method == "none":
                 h_img, w_img = image.shape[:2]
                 vision_scale = await _vision_calibration_fallback(image, h_img, w_img)
@@ -490,7 +698,7 @@ async def run_analysis(
                     )
 
             job.calibration = cal_result
-            _log_reasoning(job, "CalibrationAgent", "calibration_consensus", cal_analysis)
+            _log_and_emit("CalibrationAgent", "calibration_consensus", cal_analysis)
         except Exception as cal_err:
             logger.warning("Calibration consensus failed: %s — using vision fallback", cal_err)
             h_img, w_img = image.shape[:2]
@@ -505,23 +713,35 @@ async def run_analysis(
                 confidence=cal_confidence,
             )
             job.calibration = cal_result
-            job.reasoning_log.append(ReasoningEntry(
+            entry = ReasoningEntry(
                 agent="CalibrationAgent",
                 stage="calibration_consensus",
                 reasoning=f"Calibration consensus failed ({cal_err}). Using {cal_method} scale "
                           f"({estimated_scale:.4f} mm/px).",
                 suggestions=["Add an ArUco marker to the scene", "Draw a reference line"],
                 confidence=cal_confidence,
-            ))
+            )
+            job.reasoning_log.append(entry)
+            _emit({"type": "reasoning", "entry": entry.model_dump()})
         _notify(JobStatus.CALIBRATED)
 
         # --- Segmentation Agent ---
         _notify(JobStatus.SEGMENTING)
         mask = None
         contours = None
+
+        has_neg = any(p.get("label", 1) == 0 for p in points)
+        if not has_neg and points:
+            p0 = points[0]
+            h_seg, w_seg = image.shape[:2]
+            neg = _generate_negative_points(p0["x"], p0["y"], w_seg, h_seg)
+            seg_points = list(points) + neg
+        else:
+            seg_points = points
+
         try:
-            mask, contours, seg_analysis = await _seg_agent.run(image, points)
-            _log_reasoning(job, "SegmentationAgent", "segmentation", seg_analysis)
+            mask, contours, seg_analysis = await _seg_agent.run(image, seg_points)
+            _log_and_emit("SegmentationAgent", "segmentation", seg_analysis)
         except Exception as seg_err:
             logger.warning("SAM 2 segmentation failed: %s — trying vision polygon fallback", seg_err)
 
@@ -542,6 +762,18 @@ async def run_analysis(
         job.contours = contours
         mask_path = job_mask_path(job.id)
         cv2.imwrite(str(mask_path), mask)
+
+        # Generate and emit SAM 2 mask overlay visualization
+        try:
+            from app.pipeline.visualization import create_sam2_overlay
+            overlay = create_sam2_overlay(image, mask, contours)
+            viz_path = job_viz_path(job.id, "sam2_mask")
+            cv2.imwrite(str(viz_path), overlay)
+            _emit({"type": "viz", "name": "sam2_mask",
+                    "url": f"/api/v1/jobs/{job.id}/viz/sam2_mask"})
+        except Exception as viz_err:
+            logger.warning("SAM 2 visualization failed (non-fatal): %s", viz_err)
+
         _notify(JobStatus.SEGMENTED)
 
         # --- Video Propagation (for video uploads with 2+ key frames) ---
@@ -590,12 +822,15 @@ async def run_analysis(
             calibration_confidence=cal_result.confidence,
             image_bgr=image, mask=mask,
         )
-        _log_reasoning(job, "MeasurementAgent", "measurement", meas_analysis)
+        _log_and_emit("MeasurementAgent", "measurement", meas_analysis)
 
         # --- Vision Measurement (primary) + integration ---
         meas_result, vision_meas = await _integrate_measurements(
             meas_result, image, cal_result.confidence, job,
         )
+        # Emit the vision cross-check reasoning that _integrate_measurements added
+        if job.reasoning_log and job.reasoning_log[-1].agent == "VisionMeasurement":
+            _emit({"type": "reasoning", "entry": job.reasoning_log[-1].model_dump()})
 
         job.contours = _scale_vision_polygon_to_measurements(
             contours, meas_result, cal_result.scale_factor,
@@ -604,7 +839,6 @@ async def run_analysis(
         _notify(JobStatus.MEASURED)
 
         # --- Thickness Agent (consensus: run ALL strategies, LLM picks) ---
-        # Pass the depth_map extracted during calibration to avoid redundant I/O
         _notify(JobStatus.ESTIMATING_DEPTH)
         vision_thickness = vision_meas.thickness_mm if vision_meas else None
         thick_result, thick_analysis = await _thick_agent.run(
@@ -623,7 +857,19 @@ async def run_analysis(
 
         job.thickness_result = thick_result
         job.thickness_mm = thick_result.thickness_mm
-        _log_reasoning(job, "ThicknessAgent", "thickness_consensus", thick_analysis)
+        _log_and_emit("ThicknessAgent", "thickness_consensus", thick_analysis)
+
+        # Generate and emit Depth Anything visualization
+        try:
+            from app.pipeline.visualization import create_depth_visualization
+            depth_viz = await asyncio.to_thread(create_depth_visualization, image, mask)
+            if depth_viz is not None:
+                viz_path = job_viz_path(job.id, "depth_map")
+                cv2.imwrite(str(viz_path), depth_viz)
+                _emit({"type": "viz", "name": "depth_map",
+                        "url": f"/api/v1/jobs/{job.id}/viz/depth_map"})
+        except Exception as viz_err:
+            logger.warning("Depth visualization failed (non-fatal): %s", viz_err)
 
         if thick_result.method != ThicknessMethod.MANUAL:
             _notify(JobStatus.DEPTH_ESTIMATED)
@@ -697,9 +943,11 @@ async def _integrate_measurements(
         ratio_h = max(ph, vh) / max(min(ph, vh), 0.1)
         agree = ratio_w < 1.3 and ratio_h < 1.3
 
+        vc = vision_meas.confidence
+        pc = meas_result.confidence
+        strategy = "No change"
+
         if agree:
-            vc = vision_meas.confidence
-            pc = meas_result.confidence
             total = vc + pc
             if total > 0:
                 blend_w = (pw * pc + vw * vc) / total
@@ -710,23 +958,21 @@ async def _integrate_measurements(
                 meas_result.perimeter_mm = round(2 * (blend_w + blend_h), 2)
                 meas_result.confidence = round(max(pc, vc), 2)
                 strategy = "Blended (agreement within 30%%)"
-        elif vision_meas.confidence >= 0.5:
+        elif cal_confidence < 0.6 and vc > pc:
+            # Calibration is estimated/weak — pixel dimensions are unreliable.
+            # Trust vision which uses its own reference object for scale.
             meas_result.width_mm = round(vw, 2)
             meas_result.height_mm = round(vh, 2)
             meas_result.area_mm2 = round(vw * vh, 2)
             meas_result.perimeter_mm = round(2 * (vw + vh), 2)
-            meas_result.confidence = round(vision_meas.confidence, 2)
-            strategy = "Vision override (primary, conf >= 0.5)"
-        elif cal_confidence < 0.6 or meas_result.confidence < 0.6:
-            meas_result.width_mm = round(vw, 2)
-            meas_result.height_mm = round(vh, 2)
-            meas_result.area_mm2 = round(vw * vh, 2)
-            meas_result.perimeter_mm = round(2 * (vw + vh), 2)
-            meas_result.confidence = round(vision_meas.confidence, 2)
-            strategy = "Vision override (pixel unreliable)"
+            meas_result.confidence = round(vc, 2)
+            strategy = "Vision override (cal unreliable, vision more confident)"
         else:
-            vc = vision_meas.confidence
-            pc = meas_result.confidence
+            # Both have reasonable calibration — weighted blend.
+            logger.warning(
+                "Vision/pixel disagree: ratio_w=%.2f ratio_h=%.2f — blending",
+                ratio_w, ratio_h,
+            )
             total = vc + pc
             if total > 0:
                 blend_w = (pw * pc + vw * vc) / total
@@ -735,7 +981,7 @@ async def _integrate_measurements(
                 meas_result.height_mm = round(blend_h, 2)
                 meas_result.area_mm2 = round(blend_w * blend_h, 2)
                 meas_result.perimeter_mm = round(2 * (blend_w + blend_h), 2)
-                meas_result.confidence = round(max(pc, vc), 2)
+                meas_result.confidence = round(min(max(pc, vc), vc * 0.9), 2)
             strategy = "Blended (disagreement, weighted)"
 
         logger.info(
@@ -817,7 +1063,7 @@ async def run_before_after_analysis(
     before_image: np.ndarray,
     after_image: np.ndarray,
     marker_size_mm: float = 40.0,
-    on_progress: Optional[ProgressCallback] = None,
+    on_progress: Optional[EventCallback] = None,
 ) -> Job:
     """Run Before/After comparison -> Calibration -> Measurement -> Thickness."""
 
@@ -825,7 +1071,16 @@ async def run_before_after_analysis(
         job.status = status
         store_job(job)
         if on_progress:
-            on_progress(job.id, status)
+            on_progress(job.id, {"type": "status", "status": status.value})
+
+    def _emit(event: dict):
+        if on_progress:
+            on_progress(job.id, event)
+
+    def _log_and_emit(agent_name: str, stage: str, result):
+        _log_reasoning(job, agent_name, stage, result)
+        entry = job.reasoning_log[-1]
+        _emit({"type": "reasoning", "entry": entry.model_dump()})
 
     job.reasoning_log = []
 
@@ -851,9 +1106,6 @@ async def run_before_after_analysis(
             {"x": ba_result.centroid[0], "y": ba_result.centroid[1], "label": 1}
         ]
 
-        # --- Vision-based damage localization ---
-        # The before/after centroid is unreliable when the object moved between
-        # shots. Ask the LLM to visually identify where the break is.
         vision_loc = await _vision_locate_damage(after_image)
         if vision_loc is not None:
             cx, cy = vision_loc
@@ -865,31 +1117,37 @@ async def run_before_after_analysis(
 
         # --- SAM 2 refinement ---
         used_vision_loc = vision_loc is not None
-        img_area = ba_mask.shape[0] * ba_mask.shape[1]
+        h_img, w_img = after_image.shape[:2]
+        img_area = h_img * w_img
+
+        neg_points = _generate_negative_points(cx, cy, w_img, h_img)
+        sam_points = [{"x": cx, "y": cy, "label": 1}] + neg_points
+        logger.info(
+            "SAM 2 prompt: positive=(%d,%d) + %d negative points",
+            cx, cy, len(neg_points),
+        )
+
         try:
             _notify(JobStatus.SEGMENTING)
             sam_mask, sam_contours, seg_analysis = await _seg_agent.run(
-                after_image, [{"x": cx, "y": cy, "label": 1}],
+                after_image, sam_points,
             )
-            _log_reasoning(job, "SegmentationAgent", "sam2_refinement", seg_analysis)
+            _log_and_emit("SegmentationAgent", "sam2_refinement", seg_analysis)
 
             sam_area = int(np.sum(sam_mask > 0))
             ba_area = int(np.sum(ba_mask > 0))
             sam_ratio = sam_area / img_area
 
-            # SAM 2 segments OBJECTS, not damage. If it covers >40% of the image
-            # it grabbed the whole object, not the break. We never want that.
-            if sam_ratio > 0.40:
+            max_acceptable = 0.15
+            if sam_ratio > max_acceptable:
                 logger.info(
-                    "SAM 2 covers %.1f%% of image — segmented entire object, rejecting",
-                    sam_ratio * 100,
+                    "SAM 2 covers %.1f%% of image (>%.0f%%) — likely segmented "
+                    "entire object, rejecting",
+                    sam_ratio * 100, max_acceptable * 100,
                 )
                 mask = ba_mask
                 contours = ba_result.contours
-            elif sam_area > img_area * 0.0005 and (
-                not used_vision_loc and sam_area < ba_area * 2.5
-                or used_vision_loc
-            ):
+            elif sam_area > img_area * 0.0005:
                 mask = sam_mask
                 contours = sam_contours
                 logger.info(
@@ -907,6 +1165,17 @@ async def run_before_after_analysis(
             logger.warning("SAM 2 refinement failed (non-fatal): %s", sam_err)
             mask = ba_mask
             contours = ba_result.contours
+
+        # Emit SAM 2 overlay visualization BEFORE vision polygon overrides
+        try:
+            from app.pipeline.visualization import create_sam2_overlay
+            overlay = create_sam2_overlay(after_image, mask, contours)
+            viz_path = job_viz_path(job.id, "sam2_mask")
+            cv2.imwrite(str(viz_path), overlay)
+            _emit({"type": "viz", "name": "sam2_mask",
+                    "url": f"/api/v1/jobs/{job.id}/viz/sam2_mask"})
+        except Exception as viz_err:
+            logger.warning("SAM 2 visualization failed (non-fatal): %s", viz_err)
 
         # --- Vision polygon (always called — primary contour source) ---
         vision_poly = await _vision_get_break_polygon(after_image)
@@ -926,6 +1195,7 @@ async def run_before_after_analysis(
         job.contours = contours
         mask_path = job_mask_path(job.id)
         cv2.imwrite(str(mask_path), mask)
+
         _notify(JobStatus.SEGMENTED)
 
         logger.info(
@@ -952,7 +1222,7 @@ async def run_before_after_analysis(
                 else:
                     cal_result = CalibrationResult(scale_factor=100.0 / max(h_img, w_img, 1), method="estimated", confidence=0.3)
             job.calibration = cal_result
-            _log_reasoning(job, "CalibrationAgent", "calibration_consensus", cal_analysis)
+            _log_and_emit("CalibrationAgent", "calibration_consensus", cal_analysis)
         except Exception as cal_err:
             logger.warning("Calibration consensus failed: %s", cal_err)
             h_img, w_img = after_image.shape[:2]
@@ -961,11 +1231,13 @@ async def run_before_after_analysis(
             cal_method = "vision_estimated" if vision_scale else "estimated"
             cal_confidence = 0.5 if vision_scale else 0.3
             job.calibration = CalibrationResult(scale_factor=estimated_scale, method=cal_method, confidence=cal_confidence)
-            job.reasoning_log.append(ReasoningEntry(
+            entry = ReasoningEntry(
                 agent="CalibrationAgent", stage="calibration_consensus",
                 reasoning=f"Calibration consensus failed ({cal_err}). Using {cal_method} scale ({estimated_scale:.4f} mm/px).",
                 suggestions=["Add an ArUco marker", "Draw a reference line"], confidence=cal_confidence,
-            ))
+            )
+            job.reasoning_log.append(entry)
+            _emit({"type": "reasoning", "entry": entry.model_dump()})
         _notify(JobStatus.CALIBRATED)
 
         # --- Measurement Agent (pixel-based) ---
@@ -976,11 +1248,13 @@ async def run_before_after_analysis(
             calibration_confidence=ba_cal.confidence,
             image_bgr=after_image, mask=mask,
         )
-        _log_reasoning(job, "MeasurementAgent", "measurement", meas_analysis)
+        _log_and_emit("MeasurementAgent", "measurement", meas_analysis)
 
         meas_result, vision_meas = await _integrate_measurements(
             meas_result, after_image, ba_cal.confidence, job,
         )
+        if job.reasoning_log and job.reasoning_log[-1].agent == "VisionMeasurement":
+            _emit({"type": "reasoning", "entry": job.reasoning_log[-1].model_dump()})
 
         job.contours = _scale_vision_polygon_to_measurements(
             contours, meas_result, ba_cal.scale_factor,
@@ -1007,7 +1281,19 @@ async def run_before_after_analysis(
 
         job.thickness_result = thick_result
         job.thickness_mm = thick_result.thickness_mm
-        _log_reasoning(job, "ThicknessAgent", "thickness_consensus", thick_analysis)
+        _log_and_emit("ThicknessAgent", "thickness_consensus", thick_analysis)
+
+        # Generate and emit Depth Anything visualization
+        try:
+            from app.pipeline.visualization import create_depth_visualization
+            depth_viz = await asyncio.to_thread(create_depth_visualization, after_image, mask)
+            if depth_viz is not None:
+                viz_path = job_viz_path(job.id, "depth_map")
+                cv2.imwrite(str(viz_path), depth_viz)
+                _emit({"type": "viz", "name": "depth_map",
+                        "url": f"/api/v1/jobs/{job.id}/viz/depth_map"})
+        except Exception as viz_err:
+            logger.warning("Depth visualization failed (non-fatal): %s", viz_err)
 
         if thick_result.method != ThicknessMethod.MANUAL:
             _notify(JobStatus.DEPTH_ESTIMATED)
@@ -1028,7 +1314,7 @@ async def run_mesh_generation(
     job: Job,
     thickness_mm: float = 3.0,
     chamfer_mm: float = 0.0,
-    on_progress: Optional[ProgressCallback] = None,
+    on_progress: Optional[EventCallback] = None,
 ) -> Job:
     """Run Mesh Agent -> Validation Agent."""
 
@@ -1036,7 +1322,7 @@ async def run_mesh_generation(
         job.status = status
         store_job(job)
         if on_progress:
-            on_progress(job.id, status)
+            on_progress(job.id, {"type": "status", "status": status.value})
 
     if not job.contours or job.calibration is None or job.measurement is None:
         job.status = JobStatus.FAILED
@@ -1086,7 +1372,7 @@ async def run_prompt_mesh_generation(
     job: Job,
     thickness_mm: float | None = None,
     chamfer_mm: float = 0.0,
-    on_progress: ProgressCallback | None = None,
+    on_progress: EventCallback | None = None,
 ) -> Job:
     """Generate a mesh from a prompt-parsed shape description."""
     from app.pipeline.prompt_to_mesh import generate_mesh_from_shape
@@ -1095,7 +1381,7 @@ async def run_prompt_mesh_generation(
         job.status = status
         store_job(job)
         if on_progress:
-            on_progress(job.id, status)
+            on_progress(job.id, {"type": "status", "status": status.value})
 
     if not job.parsed_shape:
         job.status = JobStatus.FAILED
@@ -1151,7 +1437,7 @@ async def run_prompt_mesh_generation(
 
 async def run_print_check(
     job: Job,
-    on_progress: Optional[ProgressCallback] = None,
+    on_progress: Optional[EventCallback] = None,
 ) -> Job:
     """Run a single PrinterAgent check on the current print status."""
     from app.pipeline import printer as printer_svc

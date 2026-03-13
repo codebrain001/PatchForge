@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import cv2
 import numpy as np
 import torch
@@ -7,6 +9,8 @@ from PIL import Image
 
 from app.config import settings
 from app.core.exceptions import SegmentationError
+
+logger = logging.getLogger("patchforge.segmentation")
 
 _processor = None
 _model = None
@@ -99,8 +103,7 @@ def segment(
     all_masks = masks[0].squeeze(0).numpy()
     if all_masks.ndim == 3:
         scores = outputs.iou_scores.cpu().squeeze().numpy()
-        best_idx = int(np.argmax(scores))
-        mask = all_masks[best_idx]
+        mask = _select_best_mask(all_masks, scores, h * w)
     else:
         mask = all_masks
 
@@ -117,6 +120,63 @@ def segment(
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
     return binary_mask, contours
+
+
+def _select_best_mask(
+    all_masks: np.ndarray,
+    scores: np.ndarray,
+    img_area: int,
+) -> np.ndarray:
+    """Pick the best SAM 2 mask for damage/gap segmentation.
+
+    SAM 2 returns multiple masks (typically 3) ranked by predicted IoU.
+    For gap/void detection we want the SMALLEST mask that still has a
+    reasonable IoU, because the largest mask usually covers the entire
+    object rather than just the missing piece.
+
+    Strategy:
+      1. Filter masks with IoU >= 0.4 (minimum quality)
+      2. Among those, prefer masks covering 0.05%-15% of the image
+      3. Pick the smallest mask in that range
+      4. Fallback: smallest mask with IoU >= 0.4, then highest IoU
+    """
+    n_masks = all_masks.shape[0]
+    if n_masks == 1:
+        return all_masks[0]
+
+    candidates = []
+    for i in range(n_masks):
+        area = int(np.sum(all_masks[i] > 0))
+        ratio = area / img_area if img_area > 0 else 0
+        candidates.append((i, scores[i], area, ratio))
+        logger.debug(
+            "SAM 2 mask %d: IoU=%.3f area=%d (%.2f%% of image)",
+            i, scores[i], area, ratio * 100,
+        )
+
+    qualified = [(i, s, a, r) for i, s, a, r in candidates if s >= 0.4]
+    if not qualified:
+        best_idx = int(np.argmax(scores))
+        logger.debug("No masks with IoU >= 0.4, falling back to highest IoU (mask %d)", best_idx)
+        return all_masks[best_idx]
+
+    in_range = [(i, s, a, r) for i, s, a, r in qualified if 0.0005 <= r <= 0.15]
+    if in_range:
+        in_range.sort(key=lambda x: x[2])
+        chosen = in_range[0]
+        logger.debug(
+            "Selected smallest in-range mask %d: IoU=%.3f area=%d (%.2f%%)",
+            chosen[0], chosen[1], chosen[2], chosen[3] * 100,
+        )
+        return all_masks[chosen[0]]
+
+    qualified.sort(key=lambda x: x[2])
+    chosen = qualified[0]
+    logger.debug(
+        "Selected smallest qualified mask %d: IoU=%.3f area=%d (%.2f%%)",
+        chosen[0], chosen[1], chosen[2], chosen[3] * 100,
+    )
+    return all_masks[chosen[0]]
 
 
 def _postprocess_mask(mask: np.ndarray) -> np.ndarray:

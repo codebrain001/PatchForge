@@ -23,15 +23,16 @@ logger = logging.getLogger("patchforge.prompt_to_mesh")
 PARSE_SYSTEM_PROMPT = """\
 You are a precise engineering assistant that converts natural language
 descriptions of patches or 3D-printable parts into structured JSON.
-The target printer is a Bambu Lab A1 with a maximum build volume of
-256 x 256 x 256 mm. All dimensions must fit within this volume.
+The target printer is a Bambu Lab A1 (build volume: 256 x 256 x 256 mm).
+All dimensions must fit within this volume.
 
 RULES:
 - Extract the shape type, all dimensions, and thickness.
 - Reject or warn if any dimension exceeds 256 mm.
 - Resolve size references to millimetres using common objects:
+    DEFAULT coin: UK 2 pound coin = 28.4 mm diameter (bimetallic, gold center, silver rim)
     UK 1 pound coin = 23.43 mm diameter
-    UK 2 pound coin = 28.4 mm diameter
+    UK 50 pence = 27.3 mm (across flats)
     UK 1 penny = 20.3 mm diameter
     US quarter = 24.26 mm diameter
     US penny = 19.05 mm diameter
@@ -42,15 +43,15 @@ RULES:
     Tennis ball = 67 mm diameter
     Golf ball = 42.67 mm diameter
     AA battery = 14.5 mm diameter, 50.5 mm length
-    Adult index finger width ≈ 17 mm
-    Adult thumb width ≈ 20 mm
+    Adult index finger width ~17 mm
+    Adult thumb width ~20 mm
 - If the user says "the size of X", use the real-world size of X.
 - If no thickness is specified, default to 3.0 mm.
 - shape_type must be one of: circle, rectangle, ellipse, triangle, hexagon,
   star, sphere, cylinder, cube.
 - is_3d_primitive should be true ONLY for sphere, cylinder, or cube.
 
-Respond with ONLY valid JSON (no markdown, no explanation):
+Respond with ONLY a valid JSON object (no markdown, no explanation):
 {
     "shape_type": "<circle|rectangle|ellipse|triangle|hexagon|star|sphere|cylinder|cube>",
     "width_mm": <number>,

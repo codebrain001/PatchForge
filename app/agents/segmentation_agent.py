@@ -6,10 +6,14 @@ import numpy as np
 from app.agents.base import Agent, AgentResult
 
 ROLE = (
-    "You are an expert segmentation agent for identifying damaged parts in photos. "
+    "You are an expert segmentation agent in a photo-to-3D-print patch pipeline. "
+    "The goal is to segment the GAP/VOID where a piece broke off — NOT the whole object. "
+    "We need the outline of the missing piece so we can 3D-print a replacement patch. "
     "You evaluate SAM 2 segmentation masks for quality: coverage ratio, edge smoothness, "
-    "fragmentation, and whether the mask looks like a coherent physical part. "
-    "Suggest better click points or multi-point strategies if quality is poor."
+    "fragmentation, and whether the mask captures ONLY the break area. "
+    "If the mask covers more than 30% of the image, it almost certainly segmented the "
+    "whole object instead of just the gap — reject it. "
+    "Suggest better click points or negative points to exclude the intact object."
 )
 
 

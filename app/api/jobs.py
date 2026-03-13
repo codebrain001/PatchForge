@@ -8,7 +8,9 @@ import cv2
 import numpy as np
 from fastapi import APIRouter, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 
-from app.core.storage import job_side_image_path, job_reference_image_path, job_mask_path
+from fastapi.responses import FileResponse
+
+from app.core.storage import job_side_image_path, job_reference_image_path, job_mask_path, job_viz_path
 from app.models.job import Job, JobStatus, DetectionMode
 from app.models.schemas import JobResponse, SegmentRequest, GenerateRequest
 from app.agents.orchestrator import get_job, store_job, run_analysis, run_before_after_analysis, run_mesh_generation, run_prompt_mesh_generation
@@ -58,14 +60,20 @@ _ws_connections: dict[str, list[WebSocket]] = {}
 _ws_lock = asyncio.Lock()
 
 
-async def _ws_notify(job_id: str, status: JobStatus):
+async def _ws_send_raw(job_id: str, payload: dict):
+    """Send an arbitrary JSON message to all WebSocket connections for a job."""
     async with _ws_lock:
         conns = list(_ws_connections.get(job_id, []))
     for ws in conns:
         try:
-            await ws.send_json({"job_id": job_id, "status": status.value})
+            await ws.send_json(payload)
         except Exception:
             pass
+
+
+async def _ws_notify(job_id: str, status: JobStatus):
+    """Legacy status-only notification (kept for backward compatibility)."""
+    await _ws_send_raw(job_id, {"job_id": job_id, "status": status.value})
 
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
@@ -108,10 +116,11 @@ async def segment_job(job_id: str, req: SegmentRequest):
     points = [p.model_dump() for p in req.points]
     job.click_points = points
 
-    def on_progress(jid: str, status: JobStatus):
+    def on_progress(jid: str, msg: dict):
         try:
             loop = asyncio.get_running_loop()
-            loop.call_soon_threadsafe(asyncio.ensure_future, _ws_notify(jid, status))
+            msg.setdefault("job_id", jid)
+            loop.call_soon_threadsafe(asyncio.ensure_future, _ws_send_raw(jid, msg))
         except RuntimeError:
             pass
 
@@ -150,10 +159,11 @@ async def generate_mesh_endpoint(job_id: str, req: GenerateRequest):
     else:
         thickness = job.thickness_mm
 
-    def on_progress(jid: str, status: JobStatus):
+    def on_progress(jid: str, msg: dict):
         try:
             loop = asyncio.get_running_loop()
-            loop.call_soon_threadsafe(asyncio.ensure_future, _ws_notify(jid, status))
+            msg.setdefault("job_id", jid)
+            loop.call_soon_threadsafe(asyncio.ensure_future, _ws_send_raw(jid, msg))
         except RuntimeError:
             pass
 
@@ -237,10 +247,11 @@ async def auto_detect_damage(
     if before_image is None:
         raise HTTPException(500, "Reference image could not be read.")
 
-    def on_progress(jid: str, status: JobStatus):
+    def on_progress(jid: str, msg: dict):
         try:
             loop = asyncio.get_running_loop()
-            loop.call_soon_threadsafe(asyncio.ensure_future, _ws_notify(jid, status))
+            msg.setdefault("job_id", jid)
+            loop.call_soon_threadsafe(asyncio.ensure_future, _ws_send_raw(jid, msg))
         except RuntimeError:
             pass
 
@@ -407,6 +418,17 @@ async def delete_job_endpoint(job_id: str):
 
     delete_job(job_id)
     return {"detail": f"Job {job_id} deleted."}
+
+
+@router.get("/jobs/{job_id}/viz/{name}")
+async def get_visualization(job_id: str, name: str):
+    """Serve a visualization image (SAM 2 overlay or depth map)."""
+    if name not in ("sam2_mask", "depth_map"):
+        raise HTTPException(400, "Unknown visualization type.")
+    path = job_viz_path(job_id, name)
+    if not path.exists():
+        raise HTTPException(404, "Visualization not yet available.")
+    return FileResponse(str(path), media_type="image/jpeg")
 
 
 @router.websocket("/jobs/{job_id}/ws")

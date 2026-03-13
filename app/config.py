@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import torch
@@ -15,11 +16,14 @@ class Settings(BaseSettings):
 
     # --- OpenAI ---
     openai_api_key: str = ""
-    openai_model: str = "gpt-4.1-nano"
+    openai_model: str = "gpt-5.4"
+
+    # --- HuggingFace ---
+    hf_token: str = ""
 
     # --- Vision models ---
-    sam2_model_name: str = "facebook/sam2.1-hiera-small"
-    depth_model_name: str = "depth-anything/Depth-Anything-V2-Small-hf"
+    sam2_model_name: str = "facebook/sam2.1-hiera-large"
+    depth_model_name: str = "depth-anything/Depth-Anything-V2-Large-hf"
 
     # --- Calibration defaults ---
     aruco_marker_size_mm: float = 40.0
@@ -55,3 +59,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+if settings.hf_token:
+    os.environ["HF_TOKEN"] = settings.hf_token
