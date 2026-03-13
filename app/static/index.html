@@ -686,8 +686,7 @@ async function doUpload(file) {
       setStatus('Video processed! Click on the damaged area.', 'success');
     } else {
       revokeUrl(uploadObjectUrl);
-      uploadObjectUrl = URL.createObjectURL(file);
-      previewImg.src = uploadObjectUrl;
+      previewImg.src = `${API}/jobs/${jobId}/image`;
       setStatus('Photo uploaded! Click on the damaged area.', 'success');
     }
 
@@ -755,9 +754,7 @@ refFileInput.addEventListener('change', async () => {
 
     const compBefore = document.getElementById('comp-before-img');
     const compAfter = document.getElementById('comp-after-img');
-    revokeUrl(refObjectUrl);
-    refObjectUrl = URL.createObjectURL(file);
-    compBefore.src = refObjectUrl;
+    compBefore.src = `${API}/jobs/${jobId}/reference-image`;
     compAfter.src = document.getElementById('preview-img').src;
     comparisonView.classList.remove('hidden');
     autoDetectRow.classList.remove('hidden');

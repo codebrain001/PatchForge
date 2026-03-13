@@ -16,27 +16,41 @@ from app.api.helpers import job_to_response as _job_to_response
 
 
 def _decode_image_bytes(
-    contents: bytes, filename: str = "",
+    contents: bytes, filename: str = "", content_type: str = "",
 ) -> Optional[np.ndarray]:
     """Decode image bytes to a BGR numpy array, with HEIC/HEIF support."""
     ext = Path(filename).suffix.lower() if filename else ""
-    is_heif = ext in (".heic", ".heif")
+    ct = content_type.lower()
+    is_heif = (
+        ext in (".heic", ".heif")
+        or "heic" in ct
+        or "heif" in ct
+    )
 
     if is_heif:
-        try:
-            from pillow_heif import register_heif_opener
-            from PIL import Image
-            import io
-
-            register_heif_opener()
-            pil_img = Image.open(io.BytesIO(contents))
-            pil_img = pil_img.convert("RGB")
-            return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-        except Exception:
-            return None
+        return _decode_heif(contents)
 
     arr = np.frombuffer(contents, np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if image is not None:
+        return image
+
+    return _decode_heif(contents)
+
+
+def _decode_heif(contents: bytes) -> Optional[np.ndarray]:
+    """Try decoding bytes as HEIC/HEIF via pillow-heif."""
+    try:
+        from pillow_heif import register_heif_opener
+        from PIL import Image
+        import io
+
+        register_heif_opener()
+        pil_img = Image.open(io.BytesIO(contents))
+        pil_img = pil_img.convert("RGB")
+        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    except Exception:
+        return None
 
 router = APIRouter()
 
@@ -183,7 +197,7 @@ async def upload_reference_image(
     if len(contents) > 20 * 1024 * 1024:
         raise HTTPException(400, "Reference image exceeds 20 MB limit.")
 
-    image = _decode_image_bytes(contents, file.filename or "")
+    image = _decode_image_bytes(contents, file.filename or "", file.content_type or "")
     if image is None:
         raise HTTPException(400, "Could not decode reference image.")
 
@@ -320,7 +334,7 @@ async def upload_side_photo(
     if len(contents) > 20 * 1024 * 1024:
         raise HTTPException(400, "Side photo exceeds 20 MB limit.")
 
-    image = _decode_image_bytes(contents, file.filename or "")
+    image = _decode_image_bytes(contents, file.filename or "", file.content_type or "")
     if image is None:
         raise HTTPException(400, "Could not decode side photo.")
 

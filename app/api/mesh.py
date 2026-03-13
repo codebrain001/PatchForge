@@ -31,6 +31,46 @@ async def download_mesh(job_id: str):
     )
 
 
+@router.get("/jobs/{job_id}/image")
+async def get_job_image(job_id: str):
+    """Serve the job's converted PNG preview image."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found.")
+    if not job.image_path:
+        raise HTTPException(404, "No image available for this job.")
+
+    path = Path(job.image_path)
+    if not path.exists():
+        raise HTTPException(500, "Image file missing from disk.")
+
+    return FileResponse(
+        path=str(path),
+        media_type="image/png",
+        filename=f"patchforge_{job_id}.png",
+    )
+
+
+@router.get("/jobs/{job_id}/reference-image")
+async def get_reference_image(job_id: str):
+    """Serve the job's converted PNG reference (before) image."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found.")
+    if not job.reference_image_path:
+        raise HTTPException(404, "No reference image available for this job.")
+
+    path = Path(job.reference_image_path)
+    if not path.exists():
+        raise HTTPException(500, "Reference image file missing from disk.")
+
+    return FileResponse(
+        path=str(path),
+        media_type="image/png",
+        filename=f"patchforge_{job_id}_reference.png",
+    )
+
+
 @router.get("/jobs/{job_id}/mask")
 async def download_mask(job_id: str):
     job = get_job(job_id)
