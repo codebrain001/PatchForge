@@ -1,0 +1,1352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PatchForge — From Photo to Patch</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+:root {
+  --bg: #0f1117; --surface: #1a1d27; --surface2: #22252f; --border: #2a2d3a;
+  --primary: #6c63ff; --primary-hover: #5a52e0; --accent: #00d4aa;
+  --text: #e4e4e7; --text-muted: #9ca3af; --text-dim: #6b7280;
+  --danger: #ef4444; --success: #22c55e; --warn: #f59e0b;
+  --radius: 12px; --radius-lg: 16px;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 14px 32px; display: flex; align-items: center; justify-content: space-between; }
+header .brand { display: flex; align-items: center; gap: 10px; }
+header h1 { font-size: 1.3rem; font-weight: 700; background: linear-gradient(135deg, var(--primary), var(--accent)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+header .tagline { font-size: 0.8rem; color: var(--text-muted); }
+header .version { font-size: 0.7rem; color: var(--text-dim); background: var(--surface2); padding: 3px 10px; border-radius: 12px; }
+.container { max-width: 960px; margin: 0 auto; padding: 24px 20px; }
+
+/* --- Stepper --- */
+.stepper { display: flex; align-items: center; gap: 0; margin-bottom: 32px; overflow-x: auto; }
+.stepper-item { display: flex; align-items: center; gap: 8px; padding: 10px 16px; font-size: 0.82rem; font-weight: 600; color: var(--text-dim); white-space: nowrap; cursor: pointer; transition: all 0.3s; border-radius: 8px; }
+.stepper-item .num { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.75rem; border: 2px solid var(--border); color: var(--text-dim); transition: all 0.3s; flex-shrink: 0; }
+.stepper-item.active { color: var(--text); }
+.stepper-item.active .num { border-color: var(--primary); background: var(--primary); color: #fff; }
+.stepper-item.done { color: var(--success); }
+.stepper-item.done .num { border-color: var(--success); background: var(--success); color: #fff; }
+.stepper-item.error .num { border-color: var(--danger); background: var(--danger); color: #fff; }
+.stepper-line { width: 24px; height: 2px; background: var(--border); flex-shrink: 0; }
+.stepper-line.done { background: var(--success); }
+
+/* --- Wizard panels --- */
+.wizard-panel { display: none; animation: fadeIn 0.3s ease; }
+.wizard-panel.visible { display: block; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+/* --- Cards --- */
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; margin-bottom: 20px; }
+.card-header { padding: 14px 20px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 0.9rem; display: flex; justify-content: space-between; align-items: center; }
+.card-body { padding: 20px; }
+.badge { padding: 3px 10px; border-radius: 12px; font-size: 0.7rem; font-weight: 600; }
+.badge-green { background: rgba(34,197,94,.15); color: var(--success); }
+.badge-blue { background: rgba(108,99,255,.15); color: var(--primary); }
+.badge-yellow { background: rgba(245,158,11,.15); color: var(--warn); }
+.badge-red { background: rgba(239,68,68,.15); color: var(--danger); }
+
+/* --- Upload zone --- */
+.upload-zone { border: 2px dashed var(--border); border-radius: var(--radius-lg); padding: 48px 32px; text-align: center; cursor: pointer; transition: all 0.3s; }
+.upload-zone:hover, .upload-zone.drag-over { border-color: var(--primary); background: rgba(108,99,255,0.04); }
+.upload-icon { font-size: 3rem; margin-bottom: 8px; }
+.upload-zone h3 { font-size: 1.1rem; margin-bottom: 6px; }
+.upload-zone p { color: var(--text-muted); font-size: 0.85rem; line-height: 1.6; }
+.upload-type-pills { display: flex; gap: 12px; justify-content: center; margin-top: 16px; }
+.upload-type-pills .pill { padding: 8px 20px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; background: var(--surface2); border: 1px solid var(--border); color: var(--text-muted); cursor: pointer; transition: all 0.2s; }
+.upload-type-pills .pill:hover, .upload-type-pills .pill.active { border-color: var(--primary); color: var(--primary); background: rgba(108,99,255,0.08); }
+
+/* --- Image container / Mark damage --- */
+.image-container { position: relative; display: flex; align-items: center; justify-content: center; min-height: 300px; background: #000; cursor: crosshair; border-radius: var(--radius); overflow: hidden; }
+.image-container img { max-width: 100%; max-height: 500px; display: block; }
+.image-container .mask-overlay { position: absolute; top: 0; left: 0; pointer-events: none; opacity: 0.45; }
+.click-marker { position: absolute; width: 18px; height: 18px; border: 3px solid var(--accent); border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 0 8px var(--accent); }
+.click-marker.negative { border-color: var(--danger); box-shadow: 0 0 8px var(--danger); }
+.ref-line { position: absolute; pointer-events: none; }
+.ref-line line { stroke: var(--warn); stroke-width: 2; stroke-dasharray: 6 3; }
+.ref-line circle { fill: var(--warn); }
+
+/* --- Video frames strip --- */
+.frames-strip { display: flex; gap: 8px; overflow-x: auto; padding: 12px 0; }
+.frame-thumb-wrap { position: relative; flex-shrink: 0; width: 80px; height: 60px; }
+.frame-thumb { width: 80px; height: 60px; border-radius: 6px; object-fit: cover; border: 2px solid var(--border); cursor: pointer; transition: all 0.2s; flex-shrink: 0; }
+.frame-thumb:hover { border-color: var(--primary); }
+.frame-thumb.selected { border-color: var(--accent); box-shadow: 0 0 10px rgba(0,212,170,0.3); }
+.frame-thumb.has-mask { border-color: var(--success); }
+.frame-mask-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 6px; object-fit: cover; opacity: 0.35; pointer-events: none; }
+.prop-stats { display: flex; gap: 12px; padding: 8px 0 0; font-size: 0.78rem; color: var(--text-muted); }
+.prop-stats strong { color: var(--accent); }
+
+/* --- Measurements grid --- */
+.measurements { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.measure-item { background: var(--bg); padding: 14px; border-radius: 10px; }
+.measure-item .label { font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.6px; }
+.measure-item .value { font-size: 1.4rem; font-weight: 700; color: var(--accent); margin-top: 4px; }
+.thickness-display { background: var(--bg); padding: 16px; border-radius: 10px; margin-top: 12px; display: flex; align-items: center; justify-content: space-between; }
+.thickness-display .th-label { font-size: 0.82rem; color: var(--text-muted); }
+.thickness-display .th-value { font-size: 1.6rem; font-weight: 700; color: var(--primary); }
+.thickness-display .th-method { font-size: 0.7rem; margin-top: 2px; }
+
+/* --- Controls --- */
+.controls { display: flex; flex-direction: column; gap: 14px; }
+.control-row { display: flex; align-items: center; gap: 12px; }
+.control-row label { font-size: 0.85rem; color: var(--text-muted); min-width: 100px; }
+input[type="range"] { flex: 1; accent-color: var(--primary); }
+.control-row .range-val { font-weight: 700; font-size: 0.9rem; min-width: 60px; text-align: right; }
+input[type="number"], input[type="text"], input[type="password"] { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 9px 14px; border-radius: 8px; font-size: 0.9rem; }
+input[type="number"] { width: 100px; }
+input[type="text"], input[type="password"] { width: 100%; }
+
+/* --- Buttons --- */
+button { padding: 10px 22px; border: none; border-radius: 8px; font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: all 0.2s; }
+.btn-primary { background: var(--primary); color: white; }
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+.btn-success { background: var(--success); color: white; }
+.btn-success:hover { background: #1aad50; }
+.btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-muted); }
+.btn-outline:hover { border-color: var(--primary); color: var(--primary); }
+.btn-outline.active { border-color: var(--warn); color: var(--warn); background: rgba(245,158,11,.08); }
+.btn-danger { background: var(--danger); color: white; }
+.btn-lg { padding: 14px 32px; font-size: 1rem; border-radius: 10px; }
+.btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.btn-row.center { justify-content: center; }
+
+/* --- Status bar --- */
+.status-bar { padding: 12px 18px; border-radius: 10px; font-size: 0.85rem; font-weight: 500; display: none; margin-bottom: 16px; }
+.status-bar.show { display: block; }
+.status-bar.info { background: rgba(108,99,255,.1); color: var(--primary); }
+.status-bar.success { background: rgba(34,197,94,.1); color: var(--success); }
+.status-bar.error { background: rgba(239,68,68,.1); color: var(--danger); }
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid transparent; border-top-color: currentColor; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 6px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* --- Mesh info --- */
+.mesh-info { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.8rem; }
+.mesh-info span { color: var(--text-muted); }
+.mesh-info strong { color: var(--text); }
+
+/* --- 3D Viewer --- */
+#viewer-3d { width: 100%; height: 380px; background: #000; border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
+
+/* --- Reasoning --- */
+.reasoning-panel { max-height: 0; overflow: hidden; transition: max-height 0.3s ease; }
+.reasoning-panel.open { max-height: 800px; overflow-y: auto; }
+.reasoning-entry { padding: 10px 14px; border-left: 3px solid var(--primary); margin: 8px 0; background: var(--bg); border-radius: 0 8px 8px 0; font-size: 0.82rem; }
+.reasoning-entry .agent-name { color: var(--primary); font-weight: 700; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.5px; }
+.reasoning-entry .reasoning-text { margin-top: 4px; color: var(--text-muted); line-height: 1.5; }
+.reasoning-entry .suggestion { color: var(--warn); font-size: 0.78rem; margin-top: 2px; }
+.toggle-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 0.8rem; padding: 0; }
+.toggle-btn:hover { color: var(--text); }
+
+/* --- Printer panel --- */
+.printer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.printer-stat { background: var(--bg); padding: 12px; border-radius: 8px; }
+.printer-stat .psl { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.printer-stat .psv { font-size: 1.2rem; font-weight: 700; color: var(--text); margin-top: 2px; }
+.progress-bar-track { width: 100%; height: 8px; background: var(--border); border-radius: 4px; margin-top: 12px; overflow: hidden; }
+.progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--primary), var(--accent)); border-radius: 4px; transition: width 0.5s ease; }
+
+/* --- Modals --- */
+.modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,.7); z-index: 100; align-items: center; justify-content: center; }
+.modal-overlay.show { display: flex; }
+.modal-content { background: var(--surface); padding: 28px; border-radius: var(--radius-lg); width: 360px; max-width: 90vw; }
+.modal-content h3 { margin-bottom: 12px; }
+.modal-content p { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 12px; }
+
+/* --- Tab toggle (segmented control) --- */
+.tab-toggle { display: flex; background: var(--bg); border-radius: 10px; padding: 3px; gap: 2px; }
+.tab-toggle .tab-pill { flex: 1; padding: 9px 16px; border-radius: 8px; border: none; background: transparent; color: var(--text-dim); font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.25s ease; text-align: center; }
+.tab-toggle .tab-pill:hover { color: var(--text-muted); }
+.tab-toggle .tab-pill.active { background: var(--primary); color: #fff; box-shadow: 0 2px 8px rgba(108,99,255,0.35); }
+.tab-content { display: none; animation: fadeIn 0.3s ease; }
+.tab-content.visible { display: block; }
+
+/* --- Prompt input area --- */
+.prompt-area { padding: 24px; }
+.prompt-input-wrap { position: relative; }
+.prompt-input-wrap textarea { width: 100%; min-height: 100px; max-height: 240px; resize: vertical; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 16px; border-radius: 12px; font-family: inherit; font-size: 0.92rem; line-height: 1.6; transition: border-color 0.2s; }
+.prompt-input-wrap textarea::placeholder { color: var(--text-dim); }
+.prompt-input-wrap textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(108,99,255,0.12); }
+.prompt-helper { font-size: 0.78rem; color: var(--text-dim); margin-top: 8px; line-height: 1.5; }
+.btn-generate-prompt { margin-top: 16px; background: linear-gradient(135deg, var(--primary), var(--accent)); color: #fff; padding: 14px 32px; font-size: 0.95rem; font-weight: 700; border-radius: 10px; border: none; cursor: pointer; transition: opacity 0.2s; width: 100%; }
+.btn-generate-prompt:hover { opacity: 0.9; }
+.btn-generate-prompt:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* --- Helpers --- */
+.help-text { font-size: 0.82rem; color: var(--text-muted); line-height: 1.6; margin-bottom: 12px; }
+.mt-12 { margin-top: 12px; }
+.mt-16 { margin-top: 16px; }
+.mb-12 { margin-bottom: 12px; }
+.gap-8 { gap: 8px; }
+.hidden { display: none !important; }
+
+/* --- Mode selector --- */
+.mode-selector { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+
+/* --- Before/After comparison --- */
+.ref-upload-row { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; padding: 14px; background: var(--bg); border-radius: 10px; border: 1px dashed var(--border); }
+.ref-upload-row .ref-label { font-size: 0.85rem; color: var(--text-muted); flex: 1; line-height: 1.5; }
+.ref-upload-row .ref-label strong { color: var(--accent); }
+.ref-upload-row .ref-status { font-size: 0.75rem; padding: 4px 10px; border-radius: 10px; }
+.comparison-view { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+.comparison-view .comp-col { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; }
+.comparison-view .comp-col img { width: 100%; display: block; }
+.comparison-view .comp-label { position: absolute; top: 8px; left: 8px; padding: 3px 10px; border-radius: 6px; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+.comp-label.before { background: rgba(108,99,255,.85); color: #fff; }
+.comp-label.after { background: rgba(239,68,68,.85); color: #fff; }
+.ba-stats { display: flex; gap: 14px; padding: 10px 0; font-size: 0.78rem; color: var(--text-muted); flex-wrap: wrap; }
+.ba-stats strong { color: var(--accent); }
+.btn-auto-detect { background: linear-gradient(135deg, var(--primary), var(--accent)); color: #fff; padding: 12px 28px; font-size: 0.95rem; border-radius: 10px; }
+.btn-auto-detect:hover { opacity: 0.9; }
+.divider-or { display: flex; align-items: center; gap: 12px; margin: 16px 0; color: var(--text-dim); font-size: 0.8rem; }
+.divider-or::before, .divider-or::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+/* --- Loading placeholder --- */
+.viewer-loading { display: flex; align-items: center; justify-content: center; height: 380px; color: var(--text-muted); font-size: 0.9rem; }
+.viewer-loading .spinner { margin-right: 8px; }
+
+/* --- Accessibility --- */
+button:focus-visible, input:focus-visible, .stepper-item:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.btn-auto-detect:disabled, .btn-success:disabled, .btn-danger:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* --- Wizard nav row --- */
+.wizard-nav { display: flex; justify-content: space-between; margin-top: 16px; }
+
+/* --- Mobile responsive --- */
+@media (max-width: 768px) {
+  header { padding: 10px 16px; }
+  .container { padding: 16px 12px; }
+  .upload-zone { padding: 28px 16px; }
+  .measurements { grid-template-columns: 1fr; }
+  .printer-grid { grid-template-columns: 1fr; }
+  .comparison-view { grid-template-columns: 1fr; }
+  .ref-upload-row { flex-direction: column; text-align: center; }
+  .control-row label { min-width: 70px; font-size: 0.8rem; }
+  .image-container { min-height: 200px; }
+  #viewer-3d, .viewer-loading { height: 280px; }
+  .stepper-item { padding: 8px 10px; font-size: 0.75rem; }
+  .ba-stats, .prop-stats { flex-direction: column; gap: 4px; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>PatchForge</h1>
+    <span class="tagline">From Photo to Patch</span>
+  </div>
+  <span class="version">v1.0</span>
+</header>
+
+<div class="container">
+  <div class="status-bar" id="status-bar" role="status" aria-live="polite"></div>
+
+  <!-- Stepper -->
+  <div class="stepper" id="stepper">
+    <div class="stepper-item active" data-step="1" id="step-1"><span class="num">1</span> Upload</div>
+    <div class="stepper-line" id="line-1"></div>
+    <div class="stepper-item" data-step="2" id="step-2"><span class="num">2</span> Mark Damage</div>
+    <div class="stepper-line" id="line-2"></div>
+    <div class="stepper-item" data-step="3" id="step-3"><span class="num">3</span> Review</div>
+    <div class="stepper-line" id="line-3"></div>
+    <div class="stepper-item" data-step="4" id="step-4"><span class="num">4</span> Generate</div>
+    <div class="stepper-line" id="line-4"></div>
+    <div class="stepper-item" data-step="5" id="step-5"><span class="num">5</span> Print</div>
+  </div>
+
+  <!-- ==================== STEP 1: UPLOAD / GENERATE ==================== -->
+  <div class="wizard-panel visible" id="panel-1">
+    <div class="card">
+      <div class="card-header">
+        <div class="tab-toggle" id="step1-tabs">
+          <button class="tab-pill active" data-tab="upload">Upload Patch</button>
+          <button class="tab-pill" data-tab="generate">Generate Patch</button>
+        </div>
+      </div>
+
+      <!-- Upload tab content -->
+      <div class="tab-content visible" id="tab-upload">
+        <div class="card-body">
+          <div class="upload-zone" id="upload-zone" role="button" aria-label="Click or drop file to upload" tabindex="0">
+            <div class="upload-icon">+</div>
+            <h3>Drop your file here</h3>
+            <p>
+              Take a photo or short video (5-15s) of the broken object.<br>
+              Slowly pan around the damage for best results.
+            </p>
+            <div class="upload-type-pills">
+              <span class="pill active">JPEG / PNG / HEIC</span>
+              <span class="pill active">MP4 / MOV / WebM</span>
+            </div>
+            <input type="file" id="file-input" accept="image/*,video/*,.heic,.heif" hidden>
+          </div>
+        </div>
+      </div>
+
+      <!-- Generate tab content -->
+      <div class="tab-content" id="tab-generate">
+        <div class="prompt-area">
+          <div class="prompt-input-wrap">
+            <textarea id="prompt-input" rows="4" placeholder="Describe the patch you want to print...&#10;&#10;e.g. 'A circular patch the size of a 1 pound coin, 3mm thick'&#10;e.g. 'A rectangular patch 50mm x 30mm, 2mm thick'&#10;e.g. 'A star-shaped badge 40mm wide'"></textarea>
+          </div>
+          <div class="prompt-helper">The AI will parse your description into precise dimensions you can review and adjust before printing.</div>
+          <button class="btn-generate-prompt" id="btn-submit-prompt">Generate from Description</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== STEP 2: MARK DAMAGE ==================== -->
+  <div class="wizard-panel" id="panel-2">
+    <div class="card">
+      <div class="card-header">
+        Identify the Damage
+        <span id="cal-badge" class="badge" style="display:none;"></span>
+      </div>
+      <div class="card-body">
+        <!-- Before/After reference upload -->
+        <div class="ref-upload-row" id="ref-upload-row">
+          <div class="ref-label">
+            <strong>Have a photo of the intact object?</strong><br>
+            Upload it and the AI will auto-detect the missing piece — no clicking needed.
+          </div>
+          <button class="btn-primary" id="btn-upload-ref">Upload "Before" Photo</button>
+          <button class="btn-outline hidden" id="btn-clear-ref" style="font-size:0.78rem;">Clear</button>
+          <span class="ref-status badge badge-green hidden" id="ref-status-badge">Uploaded</span>
+          <input type="file" id="ref-file-input" accept="image/*,.heic,.heif" hidden>
+        </div>
+
+        <!-- Video context upload -->
+        <div class="ref-upload-row hidden" id="video-upload-row" style="margin-top:10px;">
+          <div class="ref-label">
+            <strong>Have a video walkthrough of the break?</strong><br>
+            Upload a short video showing the broken area from multiple angles for better depth/thickness estimation.
+          </div>
+          <button class="btn-outline" id="btn-upload-video-ctx">Upload Video</button>
+          <span class="ref-status badge badge-green hidden" id="video-ctx-badge">Attached</span>
+          <input type="file" id="video-ctx-input" accept="video/*,.mp4,.mov,.webm" hidden>
+        </div>
+
+        <!-- Before/After comparison view (hidden until reference uploaded) -->
+        <div class="comparison-view hidden" id="comparison-view">
+          <div class="comp-col">
+            <span class="comp-label before">Before (intact)</span>
+            <img id="comp-before-img">
+          </div>
+          <div class="comp-col">
+            <span class="comp-label after">After (broken)</span>
+            <img id="comp-after-img">
+          </div>
+        </div>
+        <div class="ba-stats hidden" id="ba-stats"></div>
+        <div class="btn-row center hidden" id="auto-detect-row">
+          <button class="btn-auto-detect" id="btn-auto-detect">Auto-Detect Damage</button>
+        </div>
+        <div class="divider-or hidden" id="divider-or">or mark manually below</div>
+
+        <p class="help-text" id="manual-help">
+          Click on the broken/missing area. The AI will outline the damage.
+          Need calibration? Switch to Reference Line mode and draw on a known-size edge.
+        </p>
+        <div class="mode-selector">
+          <button class="btn-outline active" id="btn-mode-click">Click to Mark</button>
+          <button class="btn-outline" id="btn-mode-refline">Reference Line</button>
+          <button class="btn-outline" id="btn-mode-neg">Exclude Area</button>
+        </div>
+        <div class="image-container" id="image-container" aria-label="Click on the damaged area to mark it">
+          <img id="preview-img">
+          <img id="mask-overlay" class="mask-overlay" style="display:none;">
+          <div id="markers-layer"></div>
+          <svg id="ref-line-svg" class="ref-line" style="display:none; position:absolute; top:0; left:0; width:100%; height:100%;"></svg>
+        </div>
+        <!-- Video key frames -->
+        <div class="frames-strip hidden" id="frames-strip"></div>
+        <div class="prop-stats hidden" id="prop-stats"></div>
+        <div class="control-row mt-12 hidden" id="marker-size-row">
+          <label>ArUco size</label>
+          <input type="number" id="marker-size" value="40" min="5" max="200" step="1">
+          <span class="range-val">mm</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== STEP 3: REVIEW ==================== -->
+  <div class="wizard-panel" id="panel-3">
+    <div class="card">
+      <div class="card-header">Measurements <span id="meas-confidence-badge" class="badge" style="display:none;"></span></div>
+      <div class="card-body">
+        <div class="measurements">
+          <div class="measure-item"><div class="label">Width</div><div class="value" id="m-width">--</div></div>
+          <div class="measure-item"><div class="label">Height</div><div class="value" id="m-height">--</div></div>
+          <div class="measure-item"><div class="label">Area</div><div class="value" id="m-area">--</div></div>
+          <div class="measure-item"><div class="label">Perimeter</div><div class="value" id="m-perimeter">--</div></div>
+        </div>
+        <div class="thickness-display" id="thickness-display">
+          <div>
+            <div class="th-label">Estimated Thickness</div>
+            <div class="th-value" id="th-value">--</div>
+            <div class="th-method" id="th-method" style="color:var(--text-dim)"></div>
+          </div>
+          <div id="th-badge"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">Fine-tune</div>
+      <div class="card-body">
+        <p class="help-text">Adjust if the auto-detected thickness doesn't look right. You can also upload a side photo for better estimation.</p>
+        <div class="controls">
+          <div class="control-row">
+            <label>Thickness</label>
+            <input type="range" id="thickness" value="3" min="0.5" max="20" step="0.5">
+            <span class="range-val" id="thickness-val">3.0 mm</span>
+          </div>
+          <div class="control-row">
+            <label>Chamfer</label>
+            <input type="range" id="chamfer" value="0" min="0" max="3" step="0.1">
+            <span class="range-val" id="chamfer-val">0.0 mm</span>
+          </div>
+          <div class="btn-row mt-12">
+            <button class="btn-outline" id="btn-side-photo">Upload Side Photo</button>
+            <input type="file" id="side-photo-input" accept="image/*" hidden>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="btn-row center mt-16">
+      <button class="btn-primary btn-lg" id="btn-generate">Generate 3D Patch</button>
+    </div>
+  </div>
+
+  <!-- ==================== STEP 4: GENERATE / PREVIEW ==================== -->
+  <div class="wizard-panel" id="panel-4">
+    <div class="card">
+      <div class="card-header">3D Preview</div>
+      <div id="viewer-3d" aria-label="3D mesh preview">
+        <div class="viewer-loading" id="viewer-loading"><span class="spinner"></span>Loading 3D preview...</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">Mesh Details</div>
+      <div class="card-body">
+        <div class="mesh-info" id="mesh-info">
+          <div><span>Vertices:</span> <strong id="mi-verts">--</strong></div>
+          <div><span>Faces:</span> <strong id="mi-faces">--</strong></div>
+          <div><span>Volume:</span> <strong id="mi-volume">--</strong></div>
+          <div><span>Watertight:</span> <strong id="mi-watertight">--</strong></div>
+        </div>
+      </div>
+    </div>
+    <div class="btn-row center mt-16">
+      <button class="btn-success btn-lg" id="btn-download">Download STL</button>
+      <button class="btn-primary btn-lg" id="btn-goto-print">Send to Printer</button>
+    </div>
+  </div>
+
+  <!-- ==================== STEP 5: PRINT ==================== -->
+  <div class="wizard-panel" id="panel-5">
+    <div class="card" id="slicer-status-card" style="margin-bottom:12px;">
+      <div class="card-body" style="padding:12px 16px; display:flex; align-items:center; gap:10px;">
+        <span id="slicer-indicator" style="width:10px;height:10px;border-radius:50%;background:var(--text-dim);flex-shrink:0;"></span>
+        <span id="slicer-label" style="font-size:0.85rem;color:var(--text-muted);">Checking slicer...</span>
+      </div>
+    </div>
+
+    <div class="card" id="printer-connect-card">
+      <div class="card-header">Connect to Bambu Lab Printer</div>
+      <div class="card-body">
+        <p class="help-text">Enter your printer's network details. Find the IP, access code, and serial on the printer's screen under Network settings.</p>
+        <div class="controls">
+          <div class="control-row"><label>IP Address</label><input type="text" id="pr-ip" placeholder="192.168.1.xxx"></div>
+          <div class="control-row"><label>Access Code</label><input type="password" id="pr-code" placeholder="8-digit code"></div>
+          <div class="control-row"><label>Serial</label><input type="text" id="pr-serial" placeholder="Printer serial"></div>
+          <div class="control-row"><label>Filament</label><input type="text" id="pr-filament" value="PLA"></div>
+        </div>
+        <div class="btn-row mt-16">
+          <button class="btn-primary" id="btn-connect-printer">Connect</button>
+          <button class="btn-outline" id="btn-disconnect-printer" style="display:none;">Disconnect</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card hidden" id="printer-status-card">
+      <div class="card-header">
+        Print Status
+        <span class="badge badge-green" id="pr-conn-badge">Connected</span>
+      </div>
+      <div class="card-body">
+        <div class="printer-grid">
+          <div class="printer-stat"><div class="psl">State</div><div class="psv" id="pr-state">--</div></div>
+          <div class="printer-stat"><div class="psl">Progress</div><div class="psv" id="pr-progress">--</div></div>
+          <div class="printer-stat"><div class="psl">Bed Temp</div><div class="psv" id="pr-bed">--</div></div>
+          <div class="printer-stat"><div class="psl">Nozzle Temp</div><div class="psv" id="pr-nozzle">--</div></div>
+        </div>
+        <div class="progress-bar-track mt-12">
+          <div class="progress-bar-fill" id="pr-bar" style="width:0%"></div>
+        </div>
+        <div class="btn-row mt-16">
+          <button class="btn-primary" id="btn-start-print">Start Print</button>
+          <button class="btn-outline" id="btn-pause-print" style="display:none;">Pause</button>
+          <button class="btn-danger" id="btn-stop-print" style="display:none;">Stop</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="btn-row center mt-16">
+      <button class="btn-success btn-lg" id="btn-download-2">Download STL Instead</button>
+    </div>
+  </div>
+
+  <!-- Reasoning (persistent, collapsible at bottom) -->
+  <div class="card mt-16" id="reasoning-card" style="display:none;">
+    <div class="card-header">
+      Agent Reasoning
+      <button class="toggle-btn" id="toggle-reasoning">Show</button>
+    </div>
+    <div class="reasoning-panel" id="reasoning-panel"></div>
+  </div>
+</div>
+
+<!-- Reference line modal -->
+<div class="modal-overlay" id="ref-modal" role="dialog" aria-modal="true" aria-labelledby="ref-modal-title">
+  <div class="modal-content">
+    <h3 id="ref-modal-title">Reference Line Length</h3>
+    <p>How long is the line you just drew, in real life?</p>
+    <input type="number" id="ref-line-mm-input" placeholder="Length in mm" min="1" max="1000" step="0.1">
+    <div class="btn-row mt-16">
+      <button class="btn-primary" id="ref-line-confirm">Confirm</button>
+      <button class="btn-outline" id="ref-line-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '/api/v1';
+let jobId = null, ws = null, uploadType = 'image';
+let interactionMode = 'click', clickPoints = [];
+let refLineStart = null, refLineEnd = null, refLineMM = null, drawingRefLine = false;
+let currentStep = 1;
+let printerPollTimer = null;
+let uploadObjectUrl = null, refObjectUrl = null;
+let wsRetries = 0;
+let isPromptMode = false;
+
+/* ═══════════════ UTILITIES ═══════════════ */
+async function extractError(res) {
+  try {
+    const j = await res.json();
+    if (Array.isArray(j.detail)) return j.detail.map(d => d.msg || d.loc?.join('.')).join('; ');
+    return j.detail || res.statusText;
+  } catch { return res.statusText; }
+}
+
+function fetchWithTimeout(url, opts = {}, timeoutMs = 120000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const statusTimer = setTimeout(() => setStatus('Still processing — please wait...', 'info', true), 30000);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => { clearTimeout(timer); clearTimeout(statusTimer); });
+}
+
+function asyncBtn(btn, asyncFn) {
+  btn.addEventListener('click', async () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try { await asyncFn(); } finally { btn.disabled = false; }
+  });
+}
+
+function revokeUrl(urlRef) {
+  if (urlRef && urlRef.startsWith('blob:')) URL.revokeObjectURL(urlRef);
+}
+
+/* ═══════════════ STEP NAVIGATION ═══════════════ */
+function goToStep(n) {
+  if (currentStep === 5 && n !== 5 && printerPollTimer) {
+    clearInterval(printerPollTimer); printerPollTimer = null;
+  }
+  if (isPromptMode && n === 2) { n = 3; }
+  currentStep = n;
+  for (let i = 1; i <= 5; i++) {
+    const panel = document.getElementById(`panel-${i}`);
+    const item = document.getElementById(`step-${i}`);
+    panel.classList.toggle('visible', i === n);
+    if (i < n) { item.classList.add('done'); item.classList.remove('active','error'); }
+    else if (i === n) { item.classList.add('active'); item.classList.remove('done','error'); }
+    else { item.classList.remove('active','done','error'); }
+    const line = document.getElementById(`line-${i}`);
+    if (line) line.classList.toggle('done', i < n);
+  }
+  if (n === 4 && !scene) init3DViewer();
+  if (n === 5) checkSlicerStatus();
+}
+
+document.querySelectorAll('.stepper-item').forEach(el => {
+  el.addEventListener('click', () => {
+    const s = parseInt(el.dataset.step);
+    if (s <= currentStep || el.classList.contains('done')) goToStep(s);
+  });
+});
+
+/* ═══════════════ STEP 1 TABS ═══════════════ */
+document.querySelectorAll('#step1-tabs .tab-pill').forEach(pill => {
+  pill.addEventListener('click', () => {
+    document.querySelectorAll('#step1-tabs .tab-pill').forEach(p => p.classList.remove('active'));
+    pill.classList.add('active');
+    const tab = pill.dataset.tab;
+    document.getElementById('tab-upload').classList.toggle('visible', tab === 'upload');
+    document.getElementById('tab-generate').classList.toggle('visible', tab === 'generate');
+  });
+});
+
+/* ═══════════════ PROMPT SUBMISSION ═══════════════ */
+asyncBtn(document.getElementById('btn-submit-prompt'), async () => {
+  const promptText = document.getElementById('prompt-input').value.trim();
+  if (!promptText) { setStatus('Please describe the patch you want to generate.', 'error'); return; }
+  setStatus('Parsing your description with AI...', 'info', true);
+  try {
+    const res = await fetchWithTimeout(`${API}/jobs/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: promptText }),
+    });
+    if (!res.ok) throw new Error(await extractError(res));
+    const data = await res.json();
+    jobId = data.id;
+    isPromptMode = true;
+    handleJobUpdate(data);
+
+    if (data.parsed_shape) {
+      const ps = data.parsed_shape;
+      const shapeDesc = ps.description || ps.shape_type;
+      setStatus(`Parsed: ${shapeDesc} — ${ps.width_mm}×${ps.height_mm}×${ps.thickness_mm} mm. Review and generate!`, 'success');
+    } else {
+      setStatus('Prompt parsed! Review dimensions and generate.', 'success');
+    }
+
+    goToStep(3);
+  } catch (err) { setStatus('Prompt failed: ' + err.message, 'error'); }
+});
+
+/* ═══════════════ UPLOAD ═══════════════ */
+const uploadZone = document.getElementById('upload-zone');
+const fileInput = document.getElementById('file-input');
+uploadZone.addEventListener('click', () => fileInput.click());
+uploadZone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } });
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+uploadZone.addEventListener('drop', e => { e.preventDefault(); uploadZone.classList.remove('drag-over'); if (e.dataTransfer.files.length) doUpload(e.dataTransfer.files[0]); });
+fileInput.addEventListener('change', () => { if (fileInput.files.length) doUpload(fileInput.files[0]); });
+
+async function doUpload(file) {
+  setStatus('Uploading...', 'info', true);
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch(`${API}/jobs`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error(await extractError(res));
+    const data = await res.json();
+    jobId = data.id;
+    uploadType = data.upload_type;
+
+    const previewImg = document.getElementById('preview-img');
+    if (uploadType === 'video') {
+      if (data.key_frame_count > 0) await loadFrameStrip();
+      setStatus('Video processed! Click on the damaged area.', 'success');
+    } else {
+      revokeUrl(uploadObjectUrl);
+      uploadObjectUrl = URL.createObjectURL(file);
+      previewImg.src = uploadObjectUrl;
+      setStatus('Photo uploaded! Click on the damaged area.', 'success');
+    }
+
+    connectWS();
+    goToStep(2);
+  } catch (err) { setStatus('Upload failed: ' + err.message, 'error'); }
+}
+
+async function loadFrameStrip() {
+  try {
+    const res = await fetch(`${API}/jobs/${jobId}/frames`);
+    if (!res.ok) { setStatus('Failed to load video frames.', 'error'); return; }
+    const data = await res.json();
+    if (!data.frame_urls || data.frame_urls.length === 0) return;
+    const strip = document.getElementById('frames-strip');
+    const previewImg = document.getElementById('preview-img');
+    strip.innerHTML = '';
+    strip.classList.remove('hidden');
+    const bestIdx = (data.best_frame_index >= 0 && data.best_frame_index < data.frame_urls.length) ? data.best_frame_index : 0;
+    data.frame_urls.forEach((url, i) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'frame-thumb-wrap';
+      const img = document.createElement('img');
+      img.className = 'frame-thumb' + (i === bestIdx ? ' selected' : '');
+      img.src = url;
+      img.addEventListener('click', async () => {
+        strip.querySelectorAll('.frame-thumb').forEach(t => t.classList.remove('selected'));
+        img.classList.add('selected');
+        previewImg.src = url;
+        try { await fetch(`${API}/jobs/${jobId}/frames/best/${i}`, { method: 'PUT' }); }
+        catch (e) { setStatus('Failed to set best frame.', 'error'); }
+      });
+      wrap.appendChild(img);
+      strip.appendChild(wrap);
+    });
+    previewImg.src = data.frame_urls[bestIdx];
+  } catch (err) { setStatus('Failed to load video frames.', 'error'); }
+}
+
+/* ═══════════════ BEFORE/AFTER REFERENCE ═══════════════ */
+const refFileInput = document.getElementById('ref-file-input');
+const btnUploadRef = document.getElementById('btn-upload-ref');
+const btnClearRef = document.getElementById('btn-clear-ref');
+const refStatusBadge = document.getElementById('ref-status-badge');
+const comparisonView = document.getElementById('comparison-view');
+const autoDetectRow = document.getElementById('auto-detect-row');
+const dividerOr = document.getElementById('divider-or');
+let hasReference = false;
+
+btnUploadRef.addEventListener('click', () => refFileInput.click());
+refFileInput.addEventListener('change', async () => {
+  const file = refFileInput.files[0];
+  if (!file || !jobId) return;
+  setStatus('Uploading reference photo...', 'info', true);
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch(`${API}/jobs/${jobId}/reference`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error(await extractError(res));
+    hasReference = true;
+
+    btnUploadRef.textContent = 'Change Photo';
+    refStatusBadge.classList.remove('hidden');
+    btnClearRef.classList.remove('hidden');
+
+    const compBefore = document.getElementById('comp-before-img');
+    const compAfter = document.getElementById('comp-after-img');
+    revokeUrl(refObjectUrl);
+    refObjectUrl = URL.createObjectURL(file);
+    compBefore.src = refObjectUrl;
+    compAfter.src = document.getElementById('preview-img').src;
+    comparisonView.classList.remove('hidden');
+    autoDetectRow.classList.remove('hidden');
+    dividerOr.classList.remove('hidden');
+    document.getElementById('video-upload-row').classList.remove('hidden');
+
+    setStatus('Reference uploaded! Optionally add a video, then click "Auto-Detect Damage".', 'success');
+  } catch (err) { setStatus('Reference upload failed: ' + err.message, 'error'); }
+});
+
+btnClearRef.addEventListener('click', () => {
+  hasReference = false;
+  revokeUrl(refObjectUrl); refObjectUrl = null;
+  btnUploadRef.textContent = 'Upload "Before" Photo';
+  refStatusBadge.classList.add('hidden');
+  btnClearRef.classList.add('hidden');
+  comparisonView.classList.add('hidden');
+  autoDetectRow.classList.add('hidden');
+  dividerOr.classList.add('hidden');
+  document.getElementById('ba-stats').classList.add('hidden');
+  document.getElementById('video-upload-row').classList.add('hidden');
+  setStatus('Reference cleared. Mark damage manually or upload a new reference.', 'info');
+});
+
+/* ═══════════════ VIDEO CONTEXT UPLOAD ═══════════════ */
+const videoCtxInput = document.getElementById('video-ctx-input');
+const btnUploadVideoCtx = document.getElementById('btn-upload-video-ctx');
+const videoCtxBadge = document.getElementById('video-ctx-badge');
+
+btnUploadVideoCtx.addEventListener('click', () => videoCtxInput.click());
+videoCtxInput.addEventListener('change', async () => {
+  const file = videoCtxInput.files[0];
+  if (!file || !jobId) return;
+  setStatus('Uploading video for depth context...', 'info', true);
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch(`${API}/jobs/${jobId}/video`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error(await extractError(res));
+    const data = await res.json();
+    videoCtxBadge.classList.remove('hidden');
+    btnUploadVideoCtx.textContent = 'Change Video';
+    setStatus(`Video attached! ${data.key_frame_count} frames extracted for depth analysis.`, 'success');
+  } catch (err) { setStatus('Video upload failed: ' + err.message, 'error'); }
+});
+
+asyncBtn(document.getElementById('btn-auto-detect'), async () => {
+  if (!jobId || !hasReference) return;
+  setStatus('Comparing before & after images to detect damage...', 'info', true);
+  const markerSize = parseFloat(document.getElementById('marker-size').value) || 40;
+  const res = await fetchWithTimeout(`${API}/jobs/${jobId}/auto-detect?marker_size_mm=${markerSize}`, { method: 'POST' });
+  if (!res.ok) throw new Error(await extractError(res));
+  const data = await res.json();
+  handleJobUpdate(data);
+  if (data.before_after_stats) showBeforeAfterStats(data.before_after_stats);
+});
+
+function showBeforeAfterStats(stats) {
+  const el = document.getElementById('ba-stats');
+  el.classList.remove('hidden');
+  el.innerHTML =
+    `<span>Feature matches: <strong>${stats.num_matches}</strong></span>` +
+    `<span>Alignment confidence: <strong>${(stats.alignment_confidence * 100).toFixed(1)}%</strong></span>` +
+    `<span>Damage coverage: <strong>${(stats.damage_coverage * 100).toFixed(2)}%</strong></span>`;
+}
+
+/* ═══════════════ MARK DAMAGE ═══════════════ */
+const imageContainer = document.getElementById('image-container');
+const previewImg = document.getElementById('preview-img');
+const maskOverlay = document.getElementById('mask-overlay');
+const markersLayer = document.getElementById('markers-layer');
+const refLineSvg = document.getElementById('ref-line-svg');
+
+['btn-mode-click','btn-mode-refline','btn-mode-neg'].forEach(id => {
+  document.getElementById(id).addEventListener('click', () => {
+    document.querySelectorAll('.mode-selector .btn-outline').forEach(b => b.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+    if (id === 'btn-mode-click') interactionMode = 'click';
+    else if (id === 'btn-mode-refline') { interactionMode = 'refline'; drawingRefLine = false; refLineStart = null; }
+    else interactionMode = 'negative';
+  });
+});
+
+imageContainer.addEventListener('click', e => {
+  if (!jobId) return;
+  const rect = previewImg.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return;
+  const contRect = imageContainer.getBoundingClientRect();
+  const nw = previewImg.naturalWidth, nh = previewImg.naturalHeight;
+  if (!nw || !nh) return;
+  const sx = nw / rect.width, sy = nh / rect.height;
+  const px = e.clientX - rect.left, py = e.clientY - rect.top;
+  const imgX = Math.max(0, Math.min(nw - 1, Math.round(px * sx)));
+  const imgY = Math.max(0, Math.min(nh - 1, Math.round(py * sy)));
+  const dispX = e.clientX - contRect.left, dispY = e.clientY - contRect.top;
+
+  if (interactionMode === 'refline') { handleRefLineClick(dispX, dispY, imgX, imgY); return; }
+
+  const label = interactionMode === 'negative' ? 0 : 1;
+  clickPoints.push({ x: imgX, y: imgY, label });
+  addMarker(dispX, dispY, label);
+
+  if (label === 1 && clickPoints.filter(p => p.label === 1).length === 1) runSegmentation();
+});
+
+imageContainer.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  if (!jobId) return;
+  const rect = previewImg.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return;
+  const contRect = imageContainer.getBoundingClientRect();
+  const nw = previewImg.naturalWidth, nh = previewImg.naturalHeight;
+  if (!nw || !nh) return;
+  const sx = nw / rect.width, sy = nh / rect.height;
+  const imgX = Math.max(0, Math.min(nw - 1, Math.round((e.clientX - rect.left) * sx)));
+  const imgY = Math.max(0, Math.min(nh - 1, Math.round((e.clientY - rect.top) * sy)));
+  clickPoints.push({ x: imgX, y: imgY, label: 0 });
+  addMarker(e.clientX - contRect.left, e.clientY - contRect.top, 0);
+});
+
+function addMarker(x, y, label) {
+  const m = document.createElement('div');
+  m.className = 'click-marker' + (label === 0 ? ' negative' : '');
+  m.style.left = x + 'px'; m.style.top = y + 'px';
+  markersLayer.appendChild(m);
+}
+
+/* ═══════════════ REFERENCE LINE ═══════════════ */
+function handleRefLineClick(dx, dy, ix, iy) {
+  if (!drawingRefLine) {
+    refLineStart = { disp: [dx, dy], img: [ix, iy] };
+    drawingRefLine = true;
+    refLineSvg.style.display = 'block';
+    refLineSvg.innerHTML = `<circle cx="${dx}" cy="${dy}" r="5"/>`;
+    setStatus('Click the other end of the reference line.', 'info');
+  } else {
+    refLineEnd = { disp: [dx, dy], img: [ix, iy] };
+    drawingRefLine = false;
+    refLineSvg.innerHTML = `<line x1="${refLineStart.disp[0]}" y1="${refLineStart.disp[1]}" x2="${dx}" y2="${dy}"/><circle cx="${refLineStart.disp[0]}" cy="${refLineStart.disp[1]}" r="5"/><circle cx="${dx}" cy="${dy}" r="5"/>`;
+    document.getElementById('ref-modal').classList.add('show');
+  }
+}
+
+document.getElementById('ref-line-confirm').addEventListener('click', () => {
+  const val = parseFloat(document.getElementById('ref-line-mm-input').value);
+  if (!val || val <= 0) { setStatus('Please enter a valid length in mm.', 'error'); return; }
+  refLineMM = val;
+  document.getElementById('ref-modal').classList.remove('show');
+  setStatus(`Reference line set: ${val} mm. Now click on the damage.`, 'success');
+  interactionMode = 'click';
+  document.querySelectorAll('.mode-selector .btn-outline').forEach(b => b.classList.remove('active'));
+  document.getElementById('btn-mode-click').classList.add('active');
+});
+document.getElementById('ref-line-cancel').addEventListener('click', () => {
+  document.getElementById('ref-modal').classList.remove('show');
+  refLineStart = null; refLineEnd = null; refLineMM = null;
+  drawingRefLine = false;
+  interactionMode = 'click';
+  document.querySelectorAll('.mode-selector .btn-outline').forEach(b => b.classList.remove('active'));
+  document.getElementById('btn-mode-click').classList.add('active');
+  refLineSvg.innerHTML = ''; refLineSvg.style.display = 'none';
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.getElementById('ref-modal').classList.contains('show')) {
+    document.getElementById('ref-line-cancel').click();
+  }
+});
+
+/* ═══════════════ SEGMENTATION ═══════════════ */
+async function runSegmentation() {
+  if (!jobId || clickPoints.length === 0) return;
+  setStatus('Analyzing damage (calibration + segmentation + measurement + depth)...', 'info', true);
+  const body = { points: clickPoints, marker_size_mm: parseFloat(document.getElementById('marker-size').value) || 40 };
+  if (refLineStart && refLineEnd && refLineMM) {
+    body.ref_line_start = refLineStart.img;
+    body.ref_line_end = refLineEnd.img;
+    body.ref_line_mm = refLineMM;
+  }
+  try {
+    const res = await fetchWithTimeout(`${API}/jobs/${jobId}/segment`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await extractError(res));
+    handleJobUpdate(await res.json());
+  } catch (err) { setStatus('Analysis failed: ' + err.message, 'error'); }
+}
+
+function handleJobUpdate(data) {
+  if (data.calibration) {
+    const m = data.calibration.method;
+    const badge = document.getElementById('cal-badge');
+    badge.style.display = 'inline';
+    badge.textContent = m === 'heif_depth' ? 'Depth Map' : m === 'aruco' ? 'ArUco' : m === 'reference_line' ? 'Ref Line' : m;
+    badge.className = 'badge ' + (m === 'aruco' ? 'badge-green' : m === 'heif_depth' ? 'badge-blue' : 'badge-yellow');
+  }
+  if (!isPromptMode && ['segmented','masks_propagated','measured','depth_estimated','ready'].includes(data.status)) {
+    maskOverlay.src = `${API}/jobs/${jobId}/mask?t=${Date.now()}`;
+    maskOverlay.style.display = 'block';
+    maskOverlay.style.width = previewImg.clientWidth + 'px';
+    maskOverlay.style.height = previewImg.clientHeight + 'px';
+  }
+  if (data.propagated_mask_count > 0) loadPropagatedMasks();
+  if (data.propagation_stats) showPropagationStats(data.propagation_stats);
+  if (data.measurement) {
+    const m = data.measurement;
+    const conf = m.confidence != null ? m.confidence : 1.0;
+    const confPct = Math.round(conf * 100);
+    document.getElementById('m-width').textContent = m.width_mm + ' mm';
+    document.getElementById('m-height').textContent = m.height_mm + ' mm';
+    document.getElementById('m-area').textContent = m.area_mm2 + ' mm\u00B2';
+    document.getElementById('m-perimeter').textContent = m.perimeter_mm + ' mm';
+    const mcb = document.getElementById('meas-confidence-badge');
+    mcb.style.display = '';
+    if (conf >= 0.7) {
+      mcb.className = 'badge badge-green';
+      mcb.textContent = confPct + '% confidence';
+    } else if (conf >= 0.4) {
+      mcb.className = 'badge badge-yellow';
+      mcb.textContent = confPct + '% confidence \u2014 use a reference line for better accuracy';
+    } else {
+      mcb.className = 'badge badge-red';
+      mcb.textContent = confPct + '% confidence \u2014 estimated scale, measurements may be inaccurate';
+    }
+  }
+  if (data.thickness) {
+    const t = data.thickness;
+    document.getElementById('th-value').textContent = t.thickness_mm + ' mm';
+    const slider = document.getElementById('thickness');
+    slider.value = t.thickness_mm;
+    document.getElementById('thickness-val').textContent = t.thickness_mm.toFixed(1) + ' mm';
+    const methodMap = { video_mvs: 'Video Depth', side_photo: 'Side Photo AI', lidar_depth: 'LiDAR Depth', vision_estimate: 'Vision Estimate', manual: 'Manual' };
+    document.getElementById('th-method').textContent = (methodMap[t.method] || t.method) + ` \u2022 ${Math.round(t.confidence * 100)}% confidence`;
+    const badgeEl = document.getElementById('th-badge');
+    if (t.confidence >= 0.6) badgeEl.innerHTML = '<span class="badge badge-green">Auto</span>';
+    else if (t.confidence > 0) badgeEl.innerHTML = '<span class="badge badge-yellow">Low Confidence</span>';
+    else badgeEl.innerHTML = '<span class="badge badge-red">Manual</span>';
+  }
+  if (data.measurement && ['measured','depth_estimated'].includes(data.status)) {
+    setStatus('Analysis complete! Review measurements and generate the patch.', 'success');
+    goToStep(3);
+  }
+  if (data.mesh) {
+    document.getElementById('mi-verts').textContent = data.mesh.vertex_count;
+    document.getElementById('mi-faces').textContent = data.mesh.face_count;
+    document.getElementById('mi-volume').textContent = data.mesh.volume_mm3 + ' mm\u00B3';
+    document.getElementById('mi-watertight').textContent = data.mesh.is_watertight ? 'Yes' : 'No';
+    setStatus('Patch mesh generated! Preview it in 3D.', 'success');
+    goToStep(4);
+    loadSTLPreview();
+  }
+  if (data.reasoning_log && data.reasoning_log.length > 0) renderReasoning(data.reasoning_log);
+  if (data.error) setStatus('Error: ' + data.error, 'error');
+}
+
+/* ═══════════════ PROPAGATED MASKS ═══════════════ */
+async function loadPropagatedMasks() {
+  if (!jobId || uploadType !== 'video') return;
+  try {
+    const res = await fetch(`${API}/jobs/${jobId}/propagated-masks`);
+    if (!res.ok) { setStatus('Failed to load propagated masks.', 'error'); return; }
+    const data = await res.json();
+    const strip = document.getElementById('frames-strip');
+    const wraps = strip.querySelectorAll('.frame-thumb-wrap');
+    wraps.forEach((wrap, i) => {
+      const existing = wrap.querySelector('.frame-mask-overlay');
+      if (existing) existing.remove();
+      if (i < data.mask_urls.length) {
+        const ov = document.createElement('img');
+        ov.className = 'frame-mask-overlay';
+        ov.src = data.mask_urls[i];
+        wrap.appendChild(ov);
+        const thumb = wrap.querySelector('.frame-thumb');
+        if (thumb) thumb.classList.add('has-mask');
+      }
+    });
+    if (data.stats) showPropagationStats(data.stats);
+  } catch (e) { setStatus('Failed to load propagated masks.', 'error'); }
+}
+
+function showPropagationStats(stats) {
+  const el = document.getElementById('prop-stats');
+  el.classList.remove('hidden');
+  el.innerHTML =
+    `<span>Tracked: <strong>${stats.total_frames_tracked}</strong> frames</span>` +
+    `<span>Damage visible: <strong>${stats.frames_with_damage}</strong> frames</span>` +
+    `<span>Avg coverage: <strong>${(stats.mean_coverage * 100).toFixed(2)}%</strong></span>`;
+}
+
+/* ═══════════════ SIDE PHOTO ═══════════════ */
+document.getElementById('btn-side-photo').addEventListener('click', () => document.getElementById('side-photo-input').click());
+document.getElementById('side-photo-input').addEventListener('change', async () => {
+  const file = document.getElementById('side-photo-input').files[0];
+  if (!file || !jobId) return;
+  setStatus('Uploading side photo and re-estimating thickness...', 'info', true);
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch(`${API}/jobs/${jobId}/side-photo`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error(await extractError(res));
+    handleJobUpdate(await res.json());
+    setStatus('Thickness re-estimated with side photo.', 'success');
+  } catch (err) { setStatus('Side photo failed: ' + err.message, 'error'); }
+});
+
+/* ═══════════════ GENERATE MESH ═══════════════ */
+asyncBtn(document.getElementById('btn-generate'), async () => {
+  if (!jobId) return;
+  const thickness = parseFloat(document.getElementById('thickness').value);
+  const chamfer = parseFloat(document.getElementById('chamfer').value);
+  setStatus('Generating 3D patch mesh...', 'info', true);
+  const res = await fetchWithTimeout(`${API}/jobs/${jobId}/generate`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ thickness_mm: thickness, chamfer_mm: chamfer }),
+  });
+  if (!res.ok) throw new Error(await extractError(res));
+  handleJobUpdate(await res.json());
+});
+
+const thicknessSlider = document.getElementById('thickness');
+const chamferSlider = document.getElementById('chamfer');
+thicknessSlider.addEventListener('input', () => document.getElementById('thickness-val').textContent = parseFloat(thicknessSlider.value).toFixed(1) + ' mm');
+chamferSlider.addEventListener('input', () => document.getElementById('chamfer-val').textContent = parseFloat(chamferSlider.value).toFixed(1) + ' mm');
+
+/* ═══════════════ DOWNLOAD ═══════════════ */
+document.getElementById('btn-download').addEventListener('click', () => { if (jobId) window.open(`${API}/jobs/${jobId}/mesh`, '_blank'); });
+document.getElementById('btn-download-2').addEventListener('click', () => { if (jobId) window.open(`${API}/jobs/${jobId}/mesh`, '_blank'); });
+document.getElementById('btn-goto-print').addEventListener('click', () => goToStep(5));
+
+/* ═══════════════ REASONING ═══════════════ */
+const toggleBtn = document.getElementById('toggle-reasoning');
+const reasoningPanel = document.getElementById('reasoning-panel');
+toggleBtn.addEventListener('click', () => {
+  const open = reasoningPanel.classList.toggle('open');
+  toggleBtn.textContent = open ? 'Hide' : 'Show';
+});
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function renderReasoning(log) {
+  document.getElementById('reasoning-card').style.display = 'block';
+  reasoningPanel.innerHTML = log.map(e => `
+    <div class="reasoning-entry">
+      <div class="agent-name">${esc(e.agent)} \u2014 ${esc(e.stage)}</div>
+      <div class="reasoning-text">${esc(e.reasoning)}</div>
+      ${e.suggestions && e.suggestions.length ? e.suggestions.map(s => `<div class="suggestion">\u2192 ${esc(s)}</div>`).join('') : ''}
+    </div>
+  `).join('');
+  if (!reasoningPanel.classList.contains('open')) { reasoningPanel.classList.add('open'); toggleBtn.textContent = 'Hide'; }
+}
+
+/* ═══════════════ SLICER STATUS ═══════════════ */
+async function checkSlicerStatus() {
+  const indicator = document.getElementById('slicer-indicator');
+  const label = document.getElementById('slicer-label');
+  try {
+    const res = await fetch(`${API}/printer/slicer-status`);
+    if (!res.ok) throw new Error('Failed');
+    const d = await res.json();
+    if (d.available && d.auto_slice) {
+      indicator.style.background = 'var(--success)';
+      label.textContent = `Bambu Studio slicer ready \u2014 auto-slice enabled (${d.filament}, ${d.nozzle}mm nozzle)`;
+      label.style.color = 'var(--success)';
+    } else if (d.available) {
+      indicator.style.background = 'var(--warn)';
+      label.textContent = 'Bambu Studio found but auto-slice is disabled. Set AUTO_SLICE=true in .env';
+      label.style.color = 'var(--warn)';
+    } else {
+      indicator.style.background = 'var(--warn)';
+      label.textContent = 'Bambu Studio not found \u2014 raw STL will be uploaded (printer cannot print raw STL)';
+      label.style.color = 'var(--warn)';
+    }
+  } catch (e) {
+    indicator.style.background = 'var(--text-dim)';
+    label.textContent = 'Could not check slicer status.';
+    label.style.color = 'var(--text-muted)';
+  }
+}
+
+/* ═══════════════ PRINTER ═══════════════ */
+asyncBtn(document.getElementById('btn-connect-printer'), async () => {
+  const ip = document.getElementById('pr-ip').value.trim();
+  const code = document.getElementById('pr-code').value.trim();
+  const serial = document.getElementById('pr-serial').value.trim();
+  if (!ip || !code || !serial) { setStatus('Please fill in IP, access code, and serial number.', 'error'); return; }
+  const body = { ip_address: ip, access_code: code, serial: serial, filament: document.getElementById('pr-filament').value || 'PLA' };
+  setStatus('Connecting to printer...', 'info', true);
+  const res = await fetch(`${API}/printer/connect`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await extractError(res));
+  const data = await res.json();
+  showPrinterConnected(data);
+  setStatus('Printer connected!', 'success');
+});
+
+document.getElementById('btn-disconnect-printer').addEventListener('click', async () => {
+  await fetch(`${API}/printer/disconnect`, { method: 'POST' });
+  document.getElementById('printer-status-card').classList.add('hidden');
+  document.getElementById('btn-disconnect-printer').style.display = 'none';
+  document.getElementById('btn-connect-printer').style.display = '';
+  if (printerPollTimer) { clearInterval(printerPollTimer); printerPollTimer = null; }
+  setStatus('Disconnected from printer.', 'info');
+});
+
+function showPrinterConnected(data) {
+  document.getElementById('printer-status-card').classList.remove('hidden');
+  document.getElementById('btn-disconnect-printer').style.display = '';
+  document.getElementById('btn-connect-printer').style.display = 'none';
+  updatePrinterUI(data);
+}
+
+function updatePrinterUI(d) {
+  document.getElementById('pr-state').textContent = d.state || '--';
+  document.getElementById('pr-progress').textContent = d.progress_pct != null ? d.progress_pct + '%' : '--';
+  document.getElementById('pr-bed').textContent = d.bed_temp != null ? d.bed_temp.toFixed(0) + '\u00B0C' : '--';
+  document.getElementById('pr-nozzle').textContent = d.nozzle_temp != null ? d.nozzle_temp.toFixed(0) + '\u00B0C' : '--';
+  document.getElementById('pr-bar').style.width = (d.progress_pct || 0) + '%';
+
+  const printing = d.state && ['RUNNING','running','PRINTING','printing'].some(s => d.state.toLowerCase().includes(s.toLowerCase()));
+  document.getElementById('btn-start-print').style.display = printing ? 'none' : '';
+  document.getElementById('btn-pause-print').style.display = printing ? '' : 'none';
+  document.getElementById('btn-stop-print').style.display = printing ? '' : 'none';
+}
+
+asyncBtn(document.getElementById('btn-start-print'), async () => {
+  if (!jobId) return;
+  setStatus('Slicing & sending to printer...', 'info', true);
+  const res = await fetch(`${API}/printer/jobs/${jobId}/print`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  if (!res.ok) throw new Error(await extractError(res));
+  const data = await res.json();
+  const msg = data.sliced ? 'Sliced and print started!' : 'Print started (raw STL)!';
+  setStatus(msg, 'success');
+  startPrinterPolling();
+});
+
+document.getElementById('btn-pause-print').addEventListener('click', async () => {
+  try {
+    const res = await fetch(`${API}/printer/pause`, { method: 'POST' });
+    if (!res.ok) throw new Error(await extractError(res));
+    setStatus('Print paused.', 'info');
+  } catch (err) { setStatus('Pause failed: ' + err.message, 'error'); }
+});
+
+document.getElementById('btn-stop-print').addEventListener('click', async () => {
+  if (!confirm('Stop the current print?')) return;
+  try {
+    const res = await fetch(`${API}/printer/stop`, { method: 'POST' });
+    if (!res.ok) throw new Error(await extractError(res));
+    setStatus('Print stopped.', 'info');
+  } catch (err) { setStatus('Stop failed: ' + err.message, 'error'); }
+});
+
+function startPrinterPolling() {
+  if (printerPollTimer) clearInterval(printerPollTimer);
+  printerPollTimer = setInterval(async () => {
+    try {
+      const res = await fetch(`${API}/printer/jobs/${jobId}/print-status`);
+      if (res.ok) updatePrinterUI(await res.json());
+    } catch (e) { /* printer poll failed silently */ }
+  }, 3000);
+}
+
+/* ═══════════════ WEBSOCKET ═══════════════ */
+function connectWS() {
+  if (ws) { ws.onclose = null; ws.close(); }
+  wsRetries = 0;
+  _openWS();
+}
+
+function _openWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}${API}/jobs/${jobId}/ws`);
+  ws.onopen = () => { wsRetries = 0; };
+  ws.onclose = () => { if (jobId) _scheduleReconnect(); };
+  ws.onerror = () => {};
+  ws.onmessage = e => {
+    let s;
+    try { s = JSON.parse(e.data).status; } catch (_) { return; }
+    if (s === 'comparing_images') setStatus('Comparing before & after images...', 'info', true);
+    else if (s === 'propagating_masks') setStatus('Tracking damage across video frames...', 'info', true);
+    else if (s === 'masks_propagated') setStatus('Damage tracked across all frames!', 'success');
+    else if (s === 'estimating_depth') setStatus('Estimating thickness from multiple views...', 'info', true);
+    else if (s === 'slicing') setStatus('Slicing STL with Bambu Studio...', 'info', true);
+    else if (s === 'sending_to_printer') setStatus('Uploading to printer...', 'info', true);
+    else if (s === 'printing') setStatus('Print started!', 'success');
+    else if (s === 'ready') { goToStep(4); loadSTLPreview(); }
+  };
+}
+
+function _scheduleReconnect() {
+  const delay = Math.min(1000 * Math.pow(2, wsRetries), 15000);
+  wsRetries++;
+  setTimeout(() => { if (jobId) _openWS(); }, delay);
+}
+
+/* ═══════════════ STATUS BAR ═══════════════ */
+function setStatus(msg, type = 'info', spinner = false) {
+  const bar = document.getElementById('status-bar');
+  bar.className = 'status-bar show ' + type;
+  bar.innerHTML = (spinner ? '<span class="spinner"></span>' : '') + msg;
+}
+
+/* ═══════════════ 3D VIEWER ═══════════════ */
+let scene, camera, renderer, meshObj, viewerResizeObs;
+function init3DViewer() {
+  if (typeof THREE === 'undefined') { setStatus('3D viewer unavailable (Three.js failed to load).', 'error'); return; }
+  const container = document.getElementById('viewer-3d');
+  if (!container || container.querySelector('canvas')) return;
+  const loading = document.getElementById('viewer-loading');
+
+  scene = new THREE.Scene(); scene.background = new THREE.Color(0x0f1117);
+  camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
+  camera.position.set(0, 0, 100);
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(container.clientWidth, container.clientHeight);
+  if (loading) loading.style.display = 'none';
+  container.appendChild(renderer.domElement);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+  const d = new THREE.DirectionalLight(0xffffff, 0.8); d.position.set(50, 50, 50); scene.add(d);
+
+  let drag = false, px = 0, py = 0;
+  renderer.domElement.addEventListener('mousedown', e => { drag = true; px = e.clientX; py = e.clientY; });
+  window.addEventListener('mouseup', () => { drag = false; });
+  renderer.domElement.addEventListener('mousemove', e => {
+    if (!drag || !meshObj) return;
+    meshObj.rotation.y += (e.clientX - px) * 0.01; meshObj.rotation.x += (e.clientY - py) * 0.01;
+    px = e.clientX; py = e.clientY;
+  });
+  renderer.domElement.addEventListener('wheel', e => { camera.position.z = Math.max(10, Math.min(500, camera.position.z + e.deltaY * 0.05)); });
+
+  let touchStartDist = 0, lastTouchX = 0, lastTouchY = 0;
+  renderer.domElement.addEventListener('touchstart', e => {
+    if (e.touches.length === 1) { lastTouchX = e.touches[0].clientX; lastTouchY = e.touches[0].clientY; }
+    if (e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      touchStartDist = Math.sqrt(dx * dx + dy * dy);
+    }
+  }, { passive: true });
+  renderer.domElement.addEventListener('touchmove', e => {
+    e.preventDefault();
+    if (e.touches.length === 1 && meshObj) {
+      meshObj.rotation.y += (e.touches[0].clientX - lastTouchX) * 0.01;
+      meshObj.rotation.x += (e.touches[0].clientY - lastTouchY) * 0.01;
+      lastTouchX = e.touches[0].clientX; lastTouchY = e.touches[0].clientY;
+    }
+    if (e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (touchStartDist > 0) camera.position.z = Math.max(10, Math.min(500, camera.position.z - (dist - touchStartDist) * 0.2));
+      touchStartDist = dist;
+    }
+  }, { passive: false });
+
+  viewerResizeObs = new ResizeObserver(() => {
+    if (!renderer || !camera) return;
+    const w = container.clientWidth, h = container.clientHeight;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h);
+  });
+  viewerResizeObs.observe(container);
+
+  (function anim() { requestAnimationFrame(anim); if (renderer && scene && camera) renderer.render(scene, camera); })();
+}
+
+async function loadSTLPreview() {
+  if (!jobId) return;
+  if (!scene) init3DViewer();
+  if (!scene) return;
+  const loading = document.getElementById('viewer-loading');
+  if (loading) loading.style.display = 'flex';
+  try {
+    const res = await fetch(`${API}/jobs/${jobId}/mesh`);
+    if (!res.ok) throw new Error('Failed to fetch mesh file.');
+    const buf = await res.arrayBuffer();
+    const geo = parseSTL(buf);
+    if (meshObj) {
+      meshObj.geometry.dispose();
+      meshObj.material.dispose();
+      scene.remove(meshObj);
+    }
+    meshObj = new THREE.Mesh(geo, new THREE.MeshPhongMaterial({ color: 0x6c63ff, specular: 0x222222, shininess: 60 }));
+    geo.computeBoundingBox();
+    const c = new THREE.Vector3(); geo.boundingBox.getCenter(c); meshObj.position.sub(c);
+    const s = new THREE.Vector3(); geo.boundingBox.getSize(s);
+    camera.position.z = Math.max(s.x, s.y, s.z) * 2.5;
+    scene.add(meshObj);
+    if (loading) loading.style.display = 'none';
+  } catch (err) {
+    if (loading) loading.style.display = 'none';
+    setStatus('3D preview failed: ' + err.message, 'error');
+  }
+}
+
+function parseSTL(buffer) {
+  const d = new DataView(buffer), n = d.getUint32(80, true);
+  if (n > 5000000) throw new Error('STL file too large for preview.');
+  const v = new Float32Array(n * 9), nr = new Float32Array(n * 9);
+  for (let i = 0; i < n; i++) {
+    const o = 84 + i * 50;
+    const nx = d.getFloat32(o, true), ny = d.getFloat32(o + 4, true), nz = d.getFloat32(o + 8, true);
+    for (let j = 0; j < 3; j++) {
+      const p = o + 12 + j * 12;
+      v[i * 9 + j * 3] = d.getFloat32(p, true); v[i * 9 + j * 3 + 1] = d.getFloat32(p + 4, true); v[i * 9 + j * 3 + 2] = d.getFloat32(p + 8, true);
+      nr[i * 9 + j * 3] = nx; nr[i * 9 + j * 3 + 1] = ny; nr[i * 9 + j * 3 + 2] = nz;
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(v, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nr, 3));
+  return g;
+}
+</script>
+</body>
+</html>

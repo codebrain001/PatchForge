@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+.env
+app/static/uploads/*
+app/static/masks/*
+app/static/meshes/*
+app/static/videos/*
+app/static/frames/*
+*.stl
+*.egg-info/
+.cursor/
+agent-transcripts/

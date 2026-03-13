@@ -1,0 +1,24 @@
+services:
+  patchforge:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - model-cache:/root/.cache
+      - ./app/static/uploads:/app/app/static/uploads
+      - ./app/static/masks:/app/app/static/masks
+      - ./app/static/meshes:/app/app/static/meshes
+      - ./app/static/videos:/app/app/static/videos
+      - ./app/static/frames:/app/app/static/frames
+      - ./patchforge_jobs.db:/app/patchforge_jobs.db
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  model-cache:

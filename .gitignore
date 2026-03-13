@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment / secrets
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# PatchForge runtime data
+app/static/uploads/
+app/static/masks/
+app/static/meshes/
+app/static/videos/
+app/static/frames/
+patchforge_jobs.db
+patchforge_jobs.db-shm
+patchforge_jobs.db-wal
+
+# Model cache
+*.pt
+*.bin
+*.safetensors
+
+# Claude Code utility files
+.claude/
+CLAUDE.md
+
+# Cursor
+.cursor/
+.cursorignore
+.cursorindexingignore
+.cursorrules
+
+# Talk / speaker prep (private)
+TALK_PREP.md
+
+# Agent transcripts
+agent-transcripts/
