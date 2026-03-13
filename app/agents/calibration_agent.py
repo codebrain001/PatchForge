@@ -1,19 +1,43 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 from typing import Optional
 
 import numpy as np
 
 from app.agents.base import Agent, AgentResult
+from app.core.llm import call_llm, parse_json_response
 from app.models.job import CalibrationResult
 
+logger = logging.getLogger("patchforge.agents.calibration")
+
 ROLE = (
-    "You are an expert calibration agent specializing in scale estimation from images. "
-    "You evaluate calibration results from multiple strategies (HEIF depth extraction, "
-    "ArUco marker detection, WebXR AR measurement, user reference line) and assess "
-    "accuracy and confidence. You understand camera optics, ArUco marker detection, "
-    "and depth sensing. Flag any suspicious results like implausible scale factors."
+    "You are the calibration decision engine in a photo-to-3D-print repair pipeline. "
+    "Multiple calibration strategies have been run — HEIF depth extraction, ArUco marker "
+    "detection, WebXR AR measurement, and/or user reference line. Each produced an "
+    "independent scale estimate (mm per pixel). YOUR JOB is to decide which estimate "
+    "to trust, whether to blend multiple estimates, and what the final authoritative "
+    "scale factor should be. You understand camera optics, ArUco marker geometry, "
+    "LiDAR depth sensing, and measurement uncertainty. You MUST pick one final answer."
 )
+
+CONSENSUS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "chosen_method": {"type": "string"},
+        "final_scale_factor": {"type": "number"},
+        "confidence": {"type": "number"},
+        "reasoning": {"type": "string"},
+        "suggestions": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "should_proceed": {"type": "boolean"},
+    },
+    "required": ["chosen_method", "final_scale_factor", "confidence", "reasoning", "should_proceed"],
+}
 
 
 class CalibrationAgent(Agent):
@@ -29,10 +53,16 @@ class CalibrationAgent(Agent):
         ref_line_end: Optional[tuple[int, int]] = None,
         ref_line_mm: Optional[float] = None,
         webxr_scale: Optional[float] = None,
-    ) -> tuple[CalibrationResult, AgentResult]:
-        from app.pipeline.calibration import calibrate
+    ) -> tuple[CalibrationResult, AgentResult, Optional[np.ndarray]]:
+        """
+        Run ALL calibration strategies, then let the LLM arbitrate.
 
-        cal_result = calibrate(
+        Returns:
+            (chosen CalibrationResult, AgentResult with reasoning, depth_map or None)
+        """
+        from app.pipeline.calibration import calibrate_all
+
+        all_results, depth_map = calibrate_all(
             image,
             marker_size_mm=marker_size_mm,
             original_upload_path=original_upload_path,
@@ -42,15 +72,156 @@ class CalibrationAgent(Agent):
             webxr_scale=webxr_scale,
         )
 
-        context = {
-            "scale_factor_mm_per_px": cal_result.scale_factor,
-            "method": cal_result.method,
-            "confidence": cal_result.confidence,
-            "marker_id": cal_result.marker_id,
-            "depth_map_available": cal_result.depth_map_available,
-            "image_width": image.shape[1],
-            "image_height": image.shape[0],
-        }
+        if not all_results:
+            # No algorithmic calibration succeeded — let the LLM try vision-based
+            analysis = AgentResult(
+                success=False,
+                data={"candidates": [], "image_width": image.shape[1], "image_height": image.shape[0]},
+                reasoning="No calibration strategy produced a result. Need vision-based estimation or user reference line.",
+                suggestions=["Draw a reference line on a known object", "Place an ArUco marker in the scene"],
+                confidence=0.0,
+            )
+            return CalibrationResult(scale_factor=0.0, method="none", confidence=0.0), analysis, depth_map
 
-        analysis = await self.analyze(context)
-        return cal_result, analysis
+        if len(all_results) == 1:
+            # Single result — still have LLM validate it
+            result = all_results[0]
+            analysis = await self._validate_single(result, image.shape)
+            return result, analysis, depth_map
+
+        # Multiple results — LLM consensus
+        chosen, analysis = await self._consensus(all_results, image.shape)
+        return chosen, analysis, depth_map
+
+    async def _validate_single(self, result: CalibrationResult, img_shape: tuple) -> AgentResult:
+        """Single calibration result — LLM validates plausibility."""
+        context = {
+            "candidates": [self._result_to_dict(result)],
+            "num_strategies_succeeded": 1,
+            "image_width": img_shape[1],
+            "image_height": img_shape[0],
+        }
+        return await self.analyze(context)
+
+    async def _consensus(
+        self,
+        results: list[CalibrationResult],
+        img_shape: tuple,
+    ) -> tuple[CalibrationResult, AgentResult]:
+        """Multiple results — LLM picks the best or blends them."""
+        candidates = [self._result_to_dict(r) for r in results]
+
+        prompt = (
+            f"CALIBRATION CONSENSUS REQUIRED.\n\n"
+            f"Image dimensions: {img_shape[1]}x{img_shape[0]} pixels.\n\n"
+            f"{len(results)} calibration strategies produced scale estimates:\n\n"
+        )
+        for i, c in enumerate(candidates, 1):
+            prompt += (
+                f"  Strategy {i}: {c['method']}\n"
+                f"    scale_factor: {c['scale_factor']:.6f} mm/px\n"
+                f"    confidence: {c['confidence']}\n"
+                f"    marker_id: {c.get('marker_id', 'N/A')}\n"
+                f"    depth_map: {c.get('depth_map_available', False)}\n\n"
+            )
+
+        # Check agreement
+        scales = [r.scale_factor for r in results]
+        max_s, min_s = max(scales), min(scales)
+        agreement_ratio = min_s / max_s if max_s > 0 else 0
+        prompt += f"Agreement ratio (min/max): {agreement_ratio:.3f}\n"
+        if agreement_ratio > 0.9:
+            prompt += "The strategies AGREE closely. Consider averaging.\n"
+        else:
+            prompt += "The strategies DISAGREE. You must choose which to trust and explain why.\n"
+
+        prompt += (
+            "\nYour decision:\n"
+            '- "chosen_method": which method to trust (or "blended" if averaging)\n'
+            '- "final_scale_factor": the authoritative mm-per-pixel value\n'
+            '- "confidence": your confidence in this decision (0.0-1.0)\n'
+            '- "reasoning": explain your decision process\n'
+            '- "suggestions": actionable suggestions for the user\n'
+            '- "should_proceed": whether the pipeline should continue\n'
+        )
+
+        try:
+            text, provider = await asyncio.to_thread(
+                call_llm,
+                self.role,
+                prompt,
+                CONSENSUS_SCHEMA,
+            )
+
+            parsed = parse_json_response(text)
+            final_scale = float(parsed.get("final_scale_factor", results[0].scale_factor))
+            chosen_method = parsed.get("chosen_method", results[0].method)
+            confidence = float(parsed.get("confidence", 0.5))
+
+            # Sanity: LLM must return a physically plausible scale (0.001 to 10 mm/px)
+            if final_scale <= 0 or final_scale > 10.0:
+                logger.warning(
+                    "LLM returned implausible scale_factor=%.6f — falling back to best candidate",
+                    final_scale,
+                )
+                best = max(results, key=lambda r: r.confidence)
+                final_scale = best.scale_factor
+                chosen_method = best.method
+
+            # Find the closest matching result or construct a blended one
+            if chosen_method == "blended":
+                chosen_result = CalibrationResult(
+                    scale_factor=final_scale,
+                    method="consensus_blended",
+                    confidence=confidence,
+                    depth_map_available=any(r.depth_map_available for r in results),
+                )
+            else:
+                # Pick the result matching the chosen method
+                chosen_result = next(
+                    (r for r in results if r.method == chosen_method),
+                    results[0],
+                )
+                chosen_result = CalibrationResult(
+                    scale_factor=final_scale,
+                    method=chosen_method,
+                    marker_id=chosen_result.marker_id,
+                    confidence=confidence,
+                    depth_map_available=chosen_result.depth_map_available,
+                )
+
+            analysis = AgentResult(
+                success=parsed.get("should_proceed", True),
+                data={"candidates": [self._result_to_dict(r) for r in results], "chosen": chosen_method},
+                reasoning=parsed.get("reasoning", ""),
+                suggestions=parsed.get("suggestions", []),
+                confidence=confidence,
+            )
+
+            logger.info(
+                "Calibration consensus: %s -> %.6f mm/px (conf=%.2f) from %d candidates",
+                chosen_method, final_scale, confidence, len(results),
+            )
+            return chosen_result, analysis
+
+        except Exception as e:
+            logger.warning("LLM consensus failed: %s — falling back to highest-confidence result", e)
+            best = max(results, key=lambda r: r.confidence)
+            analysis = AgentResult(
+                success=True,
+                data={"candidates": [self._result_to_dict(r) for r in results]},
+                reasoning=f"LLM consensus unavailable ({e}). Using highest-confidence result: {best.method}.",
+                suggestions=[],
+                confidence=best.confidence,
+            )
+            return best, analysis
+
+    @staticmethod
+    def _result_to_dict(r: CalibrationResult) -> dict:
+        return {
+            "method": r.method,
+            "scale_factor": r.scale_factor,
+            "confidence": r.confidence,
+            "marker_id": r.marker_id,
+            "depth_map_available": r.depth_map_available,
+        }

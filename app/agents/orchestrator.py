@@ -52,10 +52,7 @@ async def _vision_calibration_fallback(
     w_img: int,
 ) -> Optional[float]:
     """Ask the vision LLM to identify objects of known size for scale estimation."""
-    from app.core.llm import is_llm_available, call_llm_vision, parse_json_response
-
-    if not is_llm_available():
-        return None
+    from app.core.llm import call_llm_vision, parse_json_response
 
     try:
         max_dim = 800
@@ -119,10 +116,7 @@ async def _vision_locate_damage(
 
     Returns (x, y) pixel coordinates of the damage center, or None.
     """
-    from app.core.llm import is_llm_available, call_llm_vision, parse_json_response
-
-    if not is_llm_available():
-        return None
+    from app.core.llm import call_llm_vision, parse_json_response
 
     h_img, w_img = image_bgr.shape[:2]
 
@@ -203,10 +197,7 @@ async def _vision_measure_damage(
     This bypasses all pixel-based measurement and asks the LLM to estimate
     real-world dimensions from visual context (coins, fingers, known objects).
     """
-    from app.core.llm import is_llm_available, call_llm_vision, parse_json_response
-
-    if not is_llm_available():
-        return None
+    from app.core.llm import call_llm_vision, parse_json_response
 
     try:
         h_img, w_img = image_bgr.shape[:2]
@@ -221,6 +212,7 @@ async def _vision_measure_damage(
 
         system = (
             "You are a precision measurement expert for 3D-printable repair parts. "
+            "The target printer is a Bambu Lab A1 (build volume: 256 x 256 x 256 mm). "
             "You can estimate real-world dimensions from photos by comparing to "
             "objects of known size."
         )
@@ -253,10 +245,20 @@ async def _vision_measure_damage(
             "STEP 3 — Measure the missing piece:\n"
             "  * width_mm = FULL width from outermost edge to outermost edge\n"
             "  * height_mm = FULL height from outermost edge to outermost edge\n"
-            "  * thickness_mm = depth/wall thickness of the missing piece "
-            "(look at the break surface edge-on, typically 3-15mm for plastic)\n"
             "  * Add 10%% margin — too big can be sanded, too small won't fit\n\n"
-            "STEP 4 — Visual cross-check (MANDATORY):\n"
+            "STEP 4 — Estimate thickness (CRITICAL — follow this carefully):\n"
+            "  Option A (preferred): If the break EDGE is visible (you can see the wall\n"
+            "  cross-section at the fracture), measure it with proportional reasoning:\n"
+            "    * Estimate the edge/wall thickness in pixels\n"
+            "    * thickness_mm = coin_mm * (edge_thickness_px / coin_px)\n"
+            "  Option B: If the break edge is NOT visible (top-down only), infer from\n"
+            "  the object type and proportions:\n"
+            "    * 3D-printed plastic walls: typically 2-4mm\n"
+            "    * Injection-molded plastic: typically 1.5-3mm\n"
+            "    * Ceramic/porcelain: typically 3-8mm\n"
+            "    * General rule: thickness ≈ width / 5 to width / 3\n"
+            "  * Report which option you used in thickness_reasoning\n\n"
+            "STEP 5 — Visual cross-check (MANDATORY):\n"
             "  * Visually compare the break to the coin side-by-side\n"
             "  * If the break appears WIDER than the coin, width MUST be > coin diameter\n"
             "  * If the break appears TALLER than the coin, height MUST be > coin diameter\n"
@@ -271,6 +273,7 @@ async def _vision_measure_damage(
             '"break_width_px": <break width in pixels>, '
             '"break_height_px": <break height in pixels>, '
             '"reasoning": "<show coin_mm * (break_px / coin_px) calculation>", '
+            '"thickness_reasoning": "<explain how thickness was estimated: Option A or B, show calculation>", '
             '"description": "<describe the break shape>", '
             '"confidence": <0.0-1.0>}'
         )
@@ -291,12 +294,15 @@ async def _vision_measure_damage(
         ref_px = parsed.get("ref_px", 0)
         break_w_px = parsed.get("break_width_px", 0)
         break_h_px = parsed.get("break_height_px", 0)
+        thickness_reasoning = parsed.get("thickness_reasoning", "")
 
         logger.info(
             "Vision measurement reasoning: ref=%s ref_px=%s "
             "break_px=%sx%s — %s",
             ref, ref_px, break_w_px, break_h_px, reasoning,
         )
+        if thickness_reasoning:
+            logger.info("Vision thickness reasoning: %s", thickness_reasoning)
 
         if width <= 0 or height <= 0 or conf < 0.3:
             logger.warning(
@@ -334,10 +340,7 @@ async def _vision_get_break_polygon(
 
     Returns an OpenCV-style contour array, or None.
     """
-    from app.core.llm import is_llm_available, call_llm_vision, parse_json_response
-
-    if not is_llm_available():
-        return None
+    from app.core.llm import call_llm_vision, parse_json_response
 
     h_img, w_img = image_bgr.shape[:2]
 
@@ -455,10 +458,11 @@ async def run_analysis(
     job.reasoning_log = []
 
     try:
-        # --- Calibration Agent ---
+        # --- Calibration Agent (consensus: run ALL strategies, LLM picks) ---
         _notify(JobStatus.CALIBRATING)
+        depth_map = None
         try:
-            cal_result, cal_analysis = await _cal_agent.run(
+            cal_result, cal_analysis, depth_map = await _cal_agent.run(
                 image,
                 marker_size_mm=marker_size_mm,
                 original_upload_path=job.original_upload_path,
@@ -467,22 +471,33 @@ async def run_analysis(
                 ref_line_mm=ref_line_mm,
                 webxr_scale=webxr_scale,
             )
-            job.calibration = cal_result
-            _log_reasoning(job, "CalibrationAgent", "calibration", cal_analysis)
-        except Exception as cal_err:
-            logger.warning("Calibration failed, using fallback estimate: %s", cal_err)
-            h_img, w_img = image.shape[:2]
-            estimated_scale = 100.0 / max(h_img, w_img)
 
+            # If the consensus returned no usable result, try vision fallback
+            if cal_result.scale_factor <= 0 or cal_result.method == "none":
+                h_img, w_img = image.shape[:2]
+                vision_scale = await _vision_calibration_fallback(image, h_img, w_img)
+                if vision_scale is not None:
+                    cal_result = CalibrationResult(
+                        scale_factor=vision_scale,
+                        method="vision_estimated",
+                        confidence=0.5,
+                    )
+                else:
+                    cal_result = CalibrationResult(
+                        scale_factor=100.0 / max(h_img, w_img, 1),
+                        method="estimated",
+                        confidence=0.3,
+                    )
+
+            job.calibration = cal_result
+            _log_reasoning(job, "CalibrationAgent", "calibration_consensus", cal_analysis)
+        except Exception as cal_err:
+            logger.warning("Calibration consensus failed: %s — using vision fallback", cal_err)
+            h_img, w_img = image.shape[:2]
             vision_scale = await _vision_calibration_fallback(image, h_img, w_img)
-            if vision_scale is not None:
-                estimated_scale = vision_scale
-                cal_method = "vision_estimated"
-                cal_confidence = 0.5
-                logger.info("Vision calibration fallback: %.5f mm/px", estimated_scale)
-            else:
-                cal_method = "estimated"
-                cal_confidence = 0.3
+            estimated_scale = vision_scale if vision_scale else 100.0 / max(h_img, w_img, 1)
+            cal_method = "vision_estimated" if vision_scale else "estimated"
+            cal_confidence = 0.5 if vision_scale else 0.3
 
             cal_result = CalibrationResult(
                 scale_factor=estimated_scale,
@@ -492,11 +507,10 @@ async def run_analysis(
             job.calibration = cal_result
             job.reasoning_log.append(ReasoningEntry(
                 agent="CalibrationAgent",
-                stage="calibration",
-                reasoning=f"No calibration marker found. Using {cal_method} scale "
-                          f"({estimated_scale:.4f} mm/px). For accurate measurements, "
-                          f"include an ArUco marker or draw a reference line.",
-                suggestions=["Add an ArUco marker to the scene", "Use reference line calibration"],
+                stage="calibration_consensus",
+                reasoning=f"Calibration consensus failed ({cal_err}). Using {cal_method} scale "
+                          f"({estimated_scale:.4f} mm/px).",
+                suggestions=["Add an ArUco marker to the scene", "Draw a reference line"],
                 confidence=cal_confidence,
             ))
         _notify(JobStatus.CALIBRATED)
@@ -511,23 +525,21 @@ async def run_analysis(
         except Exception as seg_err:
             logger.warning("SAM 2 segmentation failed: %s — trying vision polygon fallback", seg_err)
 
-        # --- Vision polygon (primary contour source) ---
-        vision_poly = await _vision_get_break_polygon(image)
-        if vision_poly is not None:
-            poly_mask = np.zeros(image.shape[:2], dtype=np.uint8)
-            cv2.drawContours(poly_mask, [vision_poly], -1, 255, -1)
-            mask = poly_mask
-            contours = [vision_poly]
-            logger.info("Using vision-traced polygon as primary damage contour")
-
         if contours is None or len(contours) == 0:
-            raise RuntimeError(
-                "Segmentation failed: neither SAM 2 nor vision polygon "
-                "could identify the damaged area. Try clicking closer to the break."
-            )
+            vision_poly = await _vision_get_break_polygon(image)
+            if vision_poly is not None:
+                poly_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+                cv2.drawContours(poly_mask, [vision_poly], -1, 255, -1)
+                mask = poly_mask
+                contours = [vision_poly]
+                logger.info("SAM 2 failed — using vision-traced polygon as fallback contour")
+            else:
+                raise RuntimeError(
+                    "Segmentation failed: neither SAM 2 nor vision polygon "
+                    "could identify the damaged area. Try clicking closer to the break."
+                )
 
         job.contours = contours
-
         mask_path = job_mask_path(job.id)
         cv2.imwrite(str(mask_path), mask)
         _notify(JobStatus.SEGMENTED)
@@ -567,16 +579,8 @@ async def run_analysis(
                     ],
                 }
                 _notify(JobStatus.MASKS_PROPAGATED)
-                logger.info(
-                    "Video propagation for %s: %d/%d frames with damage",
-                    job.id, prop_result.frames_with_damage,
-                    prop_result.total_frames_tracked,
-                )
             except Exception as e:
-                logger.warning(
-                    "Video propagation failed for %s (non-fatal): %s",
-                    job.id, e,
-                )
+                logger.warning("Video propagation failed for %s (non-fatal): %s", job.id, e)
                 _notify(JobStatus.SEGMENTED)
 
         # --- Measurement Agent (pixel-based) ---
@@ -593,15 +597,16 @@ async def run_analysis(
             meas_result, image, cal_result.confidence, job,
         )
 
-        # Scale polygon to match measurements
         job.contours = _scale_vision_polygon_to_measurements(
             contours, meas_result, cal_result.scale_factor,
         )
         job.measurement = meas_result
         _notify(JobStatus.MEASURED)
 
-        # --- Thickness Agent ---
+        # --- Thickness Agent (consensus: run ALL strategies, LLM picks) ---
+        # Pass the depth_map extracted during calibration to avoid redundant I/O
         _notify(JobStatus.ESTIMATING_DEPTH)
+        vision_thickness = vision_meas.thickness_mm if vision_meas else None
         thick_result, thick_analysis = await _thick_agent.run(
             mask=mask,
             scale_factor=cal_result.scale_factor,
@@ -610,15 +615,15 @@ async def run_analysis(
             original_upload_path=job.original_upload_path,
             key_frame_paths=job.key_frame_paths if job.key_frame_paths else None,
             side_image_path=job.side_image_path,
-        )
-
-        thick_result = _apply_vision_thickness_override(
-            thick_result, vision_meas,
+            depth_map=depth_map,
+            vision_thickness_mm=vision_thickness,
+            calibration_method=cal_result.method,
+            image_bgr=image,
         )
 
         job.thickness_result = thick_result
         job.thickness_mm = thick_result.thickness_mm
-        _log_reasoning(job, "ThicknessAgent", "thickness_estimation", thick_analysis)
+        _log_reasoning(job, "ThicknessAgent", "thickness_consensus", thick_analysis)
 
         if thick_result.method != ThicknessMethod.MANUAL:
             _notify(JobStatus.DEPTH_ESTIMATED)
@@ -633,50 +638,6 @@ async def run_analysis(
 
     store_job(job)
     return job
-
-
-def _apply_vision_thickness_override(
-    thick_result: ThicknessResult,
-    vision_meas: Optional[VisionMeasurement],
-) -> ThicknessResult:
-    """Override pipeline thickness with vision estimate when they disagree badly."""
-    if vision_meas is None or vision_meas.thickness_mm <= 0:
-        return thick_result
-
-    pipeline_t = thick_result.thickness_mm
-    vt = vision_meas.thickness_mm
-    use_vision = False
-
-    if thick_result.method == ThicknessMethod.MANUAL:
-        use_vision = True
-    elif pipeline_t < vt * 0.3:
-        logger.info(
-            "Pipeline thickness %.2f mm is <30%% of vision estimate %.2f mm — overriding",
-            pipeline_t, vt,
-        )
-        use_vision = True
-    elif pipeline_t > vt * 5.0:
-        logger.info(
-            "Pipeline thickness %.2f mm is >5x vision estimate %.2f mm — overriding",
-            pipeline_t, vt,
-        )
-        use_vision = True
-    elif pipeline_t < 2.0 and vt >= 2.0:
-        logger.info(
-            "Pipeline thickness %.2f mm suspiciously small, vision says %.2f mm — overriding",
-            pipeline_t, vt,
-        )
-        use_vision = True
-
-    if use_vision:
-        logger.info("Using vision-estimated thickness: %.1f mm", vt)
-        return ThicknessResult(
-            thickness_mm=round(vt, 2),
-            method=ThicknessMethod.VISION_ESTIMATE,
-            confidence=round(vision_meas.confidence * 0.8, 2),
-        )
-
-    return thick_result
 
 
 def _validate_measurement_sanity(
@@ -974,45 +935,36 @@ async def run_before_after_analysis(
             ba_result.damage_coverage * 100,
         )
 
-        # --- Calibration Agent (on the "after" image) ---
+        # --- Calibration Agent (consensus on the "after" image) ---
         _notify(JobStatus.CALIBRATING)
+        ba_depth_map = None
         try:
-            cal_result, cal_analysis = await _cal_agent.run(
+            cal_result, cal_analysis, ba_depth_map = await _cal_agent.run(
                 after_image,
                 marker_size_mm=marker_size_mm,
                 original_upload_path=job.original_upload_path,
             )
+            if cal_result.scale_factor <= 0 or cal_result.method == "none":
+                h_img, w_img = after_image.shape[:2]
+                vision_scale = await _vision_calibration_fallback(after_image, h_img, w_img)
+                if vision_scale:
+                    cal_result = CalibrationResult(scale_factor=vision_scale, method="vision_estimated", confidence=0.5)
+                else:
+                    cal_result = CalibrationResult(scale_factor=100.0 / max(h_img, w_img, 1), method="estimated", confidence=0.3)
             job.calibration = cal_result
-            _log_reasoning(job, "CalibrationAgent", "calibration", cal_analysis)
+            _log_reasoning(job, "CalibrationAgent", "calibration_consensus", cal_analysis)
         except Exception as cal_err:
-            logger.warning("Calibration failed, using pixel-based estimate: %s", cal_err)
+            logger.warning("Calibration consensus failed: %s", cal_err)
             h_img, w_img = after_image.shape[:2]
-            estimated_scale = 100.0 / max(h_img, w_img)
-
-            # Ask the vision LLM to identify objects of known size for better scale
             vision_scale = await _vision_calibration_fallback(after_image, h_img, w_img)
-            if vision_scale is not None:
-                estimated_scale = vision_scale
-                cal_method = "vision_estimated"
-                cal_confidence = 0.5
-                logger.info("Vision calibration: %.5f mm/px", estimated_scale)
-            else:
-                cal_method = "estimated"
-                cal_confidence = 0.3
-
-            job.calibration = CalibrationResult(
-                scale_factor=estimated_scale,
-                method=cal_method,
-                confidence=cal_confidence,
-            )
+            estimated_scale = vision_scale if vision_scale else 100.0 / max(h_img, w_img, 1)
+            cal_method = "vision_estimated" if vision_scale else "estimated"
+            cal_confidence = 0.5 if vision_scale else 0.3
+            job.calibration = CalibrationResult(scale_factor=estimated_scale, method=cal_method, confidence=cal_confidence)
             job.reasoning_log.append(ReasoningEntry(
-                agent="CalibrationAgent",
-                stage="calibration",
-                reasoning=f"No calibration marker found. Using {cal_method} scale "
-                          f"({estimated_scale:.4f} mm/px). For accurate measurements, "
-                          f"include an ArUco marker or draw a reference line.",
-                suggestions=["Add an ArUco marker to the scene", "Use reference line calibration"],
-                confidence=cal_confidence,
+                agent="CalibrationAgent", stage="calibration_consensus",
+                reasoning=f"Calibration consensus failed ({cal_err}). Using {cal_method} scale ({estimated_scale:.4f} mm/px).",
+                suggestions=["Add an ArUco marker", "Draw a reference line"], confidence=cal_confidence,
             ))
         _notify(JobStatus.CALIBRATED)
 
@@ -1026,21 +978,19 @@ async def run_before_after_analysis(
         )
         _log_reasoning(job, "MeasurementAgent", "measurement", meas_analysis)
 
-        # --- Vision Measurement (primary) + integration ---
         meas_result, vision_meas = await _integrate_measurements(
             meas_result, after_image, ba_cal.confidence, job,
         )
 
-        # Scale polygon to match measurements
         job.contours = _scale_vision_polygon_to_measurements(
             contours, meas_result, ba_cal.scale_factor,
         )
         job.measurement = meas_result
         _notify(JobStatus.MEASURED)
 
-        # --- Thickness Agent ---
+        # --- Thickness Agent (consensus with shared depth map) ---
         _notify(JobStatus.ESTIMATING_DEPTH)
-
+        vision_thickness = vision_meas.thickness_mm if vision_meas else None
         thick_result, thick_analysis = await _thick_agent.run(
             mask=mask,
             scale_factor=ba_cal.scale_factor,
@@ -1049,15 +999,15 @@ async def run_before_after_analysis(
             original_upload_path=job.original_upload_path,
             key_frame_paths=job.key_frame_paths if job.key_frame_paths else None,
             side_image_path=job.side_image_path,
-        )
-
-        thick_result = _apply_vision_thickness_override(
-            thick_result, vision_meas,
+            depth_map=ba_depth_map,
+            vision_thickness_mm=vision_thickness,
+            calibration_method=ba_cal.method,
+            image_bgr=after_image,
         )
 
         job.thickness_result = thick_result
         job.thickness_mm = thick_result.thickness_mm
-        _log_reasoning(job, "ThicknessAgent", "thickness_estimation", thick_analysis)
+        _log_reasoning(job, "ThicknessAgent", "thickness_consensus", thick_analysis)
 
         if thick_result.method != ThicknessMethod.MANUAL:
             _notify(JobStatus.DEPTH_ESTIMATED)

@@ -1,7 +1,10 @@
+import re
 import uuid
 from pathlib import Path
 
 from app.config import settings
+
+_JOB_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
 
 def ensure_dirs() -> None:
@@ -17,6 +20,13 @@ def ensure_dirs() -> None:
 
 def generate_job_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def validate_job_id(job_id: str) -> str:
+    """Validate that a job_id is a safe hex string. Raises ValueError if not."""
+    if not _JOB_ID_RE.match(job_id):
+        raise ValueError(f"Invalid job ID format: {job_id!r}")
+    return job_id
 
 
 # --- Image paths ---

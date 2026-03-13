@@ -29,6 +29,68 @@ logger = logging.getLogger("patchforge.thickness")
 # Strategy 1: LiDAR depth difference
 # ---------------------------------------------------------------------------
 
+def _compute_lidar_thickness(
+    depth_map: np.ndarray,
+    mask: np.ndarray,
+) -> Optional[ThicknessResult]:
+    """Shared logic: compute thickness from a depth map and damage mask."""
+    mask_resized = mask
+    if depth_map.shape[:2] != mask.shape[:2]:
+        mask_resized = cv2.resize(
+            mask, (depth_map.shape[1], depth_map.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+    damage_mask = mask_resized > 127
+    if np.sum(damage_mask) < 10:
+        return None
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    dilated = cv2.dilate(mask_resized, kernel, iterations=2)
+    surround_mask = (dilated > 127) & (~damage_mask)
+
+    if np.sum(surround_mask) < 10:
+        return None
+
+    valid_damage = depth_map[damage_mask]
+    valid_damage = valid_damage[valid_damage > 0]
+    valid_surround = depth_map[surround_mask]
+    valid_surround = valid_surround[valid_surround > 0]
+
+    if len(valid_damage) < 5 or len(valid_surround) < 5:
+        return None
+
+    median_damage = float(np.median(valid_damage))
+    median_surround = float(np.median(valid_surround))
+    depth_diff = abs(median_damage - median_surround)
+
+    if depth_diff < 0.001:
+        return None
+
+    if max(median_damage, median_surround) > 10:
+        disp_damage = median_damage / 255.0 + 0.01
+        disp_surround = median_surround / 255.0 + 0.01
+        thickness_mm = abs(1.0 / disp_damage - 1.0 / disp_surround) * 1000.0
+    else:
+        thickness_mm = depth_diff * 1000.0
+
+    thickness_mm = max(0.5, min(50.0, thickness_mm))
+    confidence = 0.70 if 1.0 <= thickness_mm <= 30.0 else 0.40
+
+    logger.info(
+        "LiDAR depth thickness: %.2f mm (damage=%.3f, surround=%.3f, conf=%.2f)",
+        thickness_mm, median_damage, median_surround, confidence,
+    )
+
+    return ThicknessResult(
+        thickness_mm=round(thickness_mm, 2),
+        method=ThicknessMethod.LIDAR_DEPTH,
+        confidence=confidence,
+        depth_map_used=True,
+        num_views_used=1,
+    )
+
+
 def estimate_from_lidar_depth(
     original_upload_path: str,
     mask: np.ndarray,
@@ -46,76 +108,14 @@ def estimate_from_lidar_depth(
     try:
         from app.pipeline.depth_extraction import extract_depth_map
         depth_map = extract_depth_map(original_upload_path)
-    except Exception:
+    except Exception as e:
+        logger.warning("Depth extraction failed for %s: %s", original_upload_path, e)
         return None
 
     if depth_map is None:
         return None
 
-    mask_resized = mask
-    if depth_map.shape[:2] != mask.shape[:2]:
-        mask_resized = cv2.resize(
-            mask, (depth_map.shape[1], depth_map.shape[0]),
-            interpolation=cv2.INTER_NEAREST,
-        )
-
-    damage_mask = mask_resized > 127
-    if np.sum(damage_mask) < 10:
-        return None
-
-    # Create a surrounding "ring" mask: dilate the damage mask and subtract
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
-    dilated = cv2.dilate(mask_resized, kernel, iterations=2)
-    surround_mask = (dilated > 127) & (~damage_mask)
-
-    if np.sum(surround_mask) < 10:
-        return None
-
-    depth_damage = depth_map[damage_mask]
-    depth_surround = depth_map[surround_mask]
-
-    valid_damage = depth_damage[depth_damage > 0]
-    valid_surround = depth_surround[depth_surround > 0]
-
-    if len(valid_damage) < 5 or len(valid_surround) < 5:
-        return None
-
-    median_damage = float(np.median(valid_damage))
-    median_surround = float(np.median(valid_surround))
-
-    depth_diff = abs(median_damage - median_surround)
-    if depth_diff < 0.001:
-        return None
-
-    # Convert depth units to mm. iPhone depth maps use varying scales;
-    # heuristic: if values are large (8-bit range), treat as disparity
-    if max(median_damage, median_surround) > 10:
-        disp_damage = median_damage / 255.0 + 0.01
-        disp_surround = median_surround / 255.0 + 0.01
-        dist_damage_m = 1.0 / disp_damage
-        dist_surround_m = 1.0 / disp_surround
-        thickness_mm = abs(dist_damage_m - dist_surround_m) * 1000.0
-    else:
-        thickness_mm = depth_diff * 1000.0
-
-    thickness_mm = max(0.5, min(50.0, thickness_mm))
-
-    confidence = 0.70
-    if thickness_mm < 1.0 or thickness_mm > 30.0:
-        confidence = 0.40
-
-    logger.info(
-        "LiDAR depth thickness: %.2f mm (damage=%.3f, surround=%.3f, conf=%.2f)",
-        thickness_mm, median_damage, median_surround, confidence,
-    )
-
-    return ThicknessResult(
-        thickness_mm=round(thickness_mm, 2),
-        method=ThicknessMethod.LIDAR_DEPTH,
-        confidence=confidence,
-        depth_map_used=True,
-        num_views_used=1,
-    )
+    return _compute_lidar_thickness(depth_map, mask)
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +279,7 @@ def estimate_from_side_photo(
     The scale factor (mm/px) from calibration is provided so Gemini can
     reason about absolute distances.
     """
-    from app.core.llm import is_llm_available, call_llm_vision, parse_json_response
-
-    if not is_llm_available():
-        logger.info("No LLM configured; skipping side-photo thickness.")
-        return None
+    from app.core.llm import call_llm_vision, parse_json_response
 
     if not Path(side_image_path).exists():
         return None
@@ -300,7 +296,10 @@ def estimate_from_side_photo(
         if manual_hint_mm is not None:
             hint_text = f" The user estimates the depth is approximately {manual_hint_mm} mm."
 
-        system = "You are a computer vision expert analyzing physical objects for 3D printing repair."
+        system = (
+            "You are a computer vision expert analyzing physical objects for 3D printing repair. "
+            "The target printer is a Bambu Lab A1 (build volume: 256 x 256 x 256 mm)."
+        )
         prompt = (
             "You are analyzing a side-angle photograph of a broken/damaged object. "
             "The damage area has already been measured from a top-down view:\n"
@@ -347,8 +346,121 @@ def estimate_from_side_photo(
 
 
 # ---------------------------------------------------------------------------
-# Hybrid router: try all strategies in cascade
+# Consensus router: run ALL strategies, return ALL results for LLM arbitration
 # ---------------------------------------------------------------------------
+
+def estimate_thickness_all(
+    original_upload_path: Optional[str],
+    mask: np.ndarray,
+    scale_factor: float,
+    measurement_width_mm: float,
+    measurement_height_mm: float,
+    key_frame_paths: Optional[list[str]] = None,
+    side_image_path: Optional[str] = None,
+    manual_hint_mm: Optional[float] = None,
+    depth_map: Optional[np.ndarray] = None,
+    image_bgr: Optional[np.ndarray] = None,
+) -> list[ThicknessResult]:
+    """
+    Run ALL applicable thickness estimation strategies and return every result.
+
+    The LLM decides which estimate to trust — this function collects evidence.
+    Accepts an optional pre-extracted depth_map from the calibration stage
+    to avoid redundant extraction.
+    """
+    results: list[ThicknessResult] = []
+
+    # Strategy 1: LiDAR depth (use pre-extracted depth_map if available)
+    if original_upload_path:
+        if depth_map is not None:
+            result = _estimate_lidar_from_preloaded(depth_map, mask, scale_factor)
+        else:
+            result = estimate_from_lidar_depth(original_upload_path, mask, scale_factor)
+        if result is not None:
+            logger.info("LiDAR thickness candidate: %.2f mm (conf=%.2f)", result.thickness_mm, result.confidence)
+            results.append(result)
+
+    # Strategy 2: Video multi-view
+    if key_frame_paths and len(key_frame_paths) >= 2:
+        result = estimate_from_video_frames(
+            key_frame_paths, mask, scale_factor,
+            measurement_width_mm, measurement_height_mm,
+        )
+        if result is not None:
+            logger.info("Video MVS thickness candidate: %.2f mm (conf=%.2f)", result.thickness_mm, result.confidence)
+            results.append(result)
+
+    # Strategy 3: Side photo + LLM vision
+    if side_image_path and Path(side_image_path).exists():
+        result = estimate_from_side_photo(
+            side_image_path, scale_factor,
+            measurement_width_mm, measurement_height_mm,
+            manual_hint_mm=manual_hint_mm,
+        )
+        if result is not None:
+            logger.info("Side-photo thickness candidate: %.2f mm (conf=%.2f)", result.thickness_mm, result.confidence)
+            results.append(result)
+
+    # Strategy 4: Monocular depth on the primary image
+    if mask is not None and scale_factor > 0:
+        mono_result = _estimate_monocular_thickness(mask, scale_factor, measurement_width_mm, measurement_height_mm, image_bgr=image_bgr)
+        if mono_result is not None:
+            logger.info("Monocular depth thickness candidate: %.2f mm (conf=%.2f)", mono_result.thickness_mm, mono_result.confidence)
+            results.append(mono_result)
+
+    logger.info(
+        "Thickness consensus: %d candidates collected [%s]",
+        len(results),
+        ", ".join(f"{r.method.value}={r.thickness_mm:.1f}mm" for r in results),
+    )
+
+    return results
+
+
+def _estimate_lidar_from_preloaded(
+    depth_map: np.ndarray,
+    mask: np.ndarray,
+    scale_factor: float,
+) -> Optional[ThicknessResult]:
+    """Use a pre-extracted depth map (avoids re-reading the HEIF file)."""
+    return _compute_lidar_thickness(depth_map, mask)
+
+
+def _estimate_monocular_thickness(
+    mask: np.ndarray,
+    scale_factor: float,
+    measurement_width_mm: float,
+    measurement_height_mm: float,
+    image_bgr: Optional[np.ndarray] = None,
+) -> Optional[ThicknessResult]:
+    """Run the monocular depth model on the actual image to estimate thickness from depth contrast."""
+    if image_bgr is None:
+        return None
+
+    pipe = _load_depth_model()
+    if pipe is None:
+        return None
+
+    try:
+        ratio = _estimate_depth_for_frame(image_bgr, mask)
+        if ratio is None or ratio < 0.001:
+            return None
+
+        ref_dim = min(measurement_width_mm, measurement_height_mm) if measurement_height_mm > 0 else measurement_width_mm
+        thickness_mm = ratio * ref_dim * settings.depth_width_scale
+        thickness_mm = max(0.5, min(50.0, thickness_mm))
+
+        return ThicknessResult(
+            thickness_mm=round(thickness_mm, 2),
+            method=ThicknessMethod.VISION_ESTIMATE,
+            confidence=0.35,
+            depth_map_used=True,
+            num_views_used=1,
+        )
+    except Exception as e:
+        logger.warning("Monocular thickness estimation failed: %s", e)
+        return None
+
 
 def estimate_thickness(
     original_upload_path: Optional[str],
@@ -360,52 +472,15 @@ def estimate_thickness(
     side_image_path: Optional[str] = None,
     manual_hint_mm: Optional[float] = None,
 ) -> ThicknessResult:
-    """
-    Try all thickness estimation strategies in priority order.
-
-    Returns the best result, or a manual-fallback result with zero confidence
-    if all strategies fail.
-    """
-    strategies_tried: list[str] = []
-
-    # Strategy 1: LiDAR depth
-    if original_upload_path:
-        strategies_tried.append("lidar_depth")
-        result = estimate_from_lidar_depth(
-            original_upload_path, mask, scale_factor,
-        )
-        if result is not None:
-            logger.info("Thickness resolved via LiDAR depth: %.2f mm", result.thickness_mm)
-            return result
-
-    # Strategy 2: Video multi-view
-    if key_frame_paths and len(key_frame_paths) >= 2:
-        strategies_tried.append("video_mvs")
-        result = estimate_from_video_frames(
-            key_frame_paths, mask, scale_factor,
-            measurement_width_mm, measurement_height_mm,
-        )
-        if result is not None:
-            logger.info("Thickness resolved via video MVS: %.2f mm", result.thickness_mm)
-            return result
-
-    # Strategy 3: Side photo + Gemini
-    if side_image_path and Path(side_image_path).exists():
-        strategies_tried.append("side_photo")
-        result = estimate_from_side_photo(
-            side_image_path, scale_factor,
-            measurement_width_mm, measurement_height_mm,
-            manual_hint_mm=manual_hint_mm,
-        )
-        if result is not None:
-            logger.info("Thickness resolved via side photo: %.2f mm", result.thickness_mm)
-            return result
-
-    # All strategies failed — return a manual fallback placeholder
-    logger.warning(
-        "All thickness strategies failed (tried: %s). Falling back to manual.",
-        ", ".join(strategies_tried) if strategies_tried else "none",
+    """Legacy single-result wrapper. Prefer estimate_thickness_all() + LLM consensus."""
+    results = estimate_thickness_all(
+        original_upload_path, mask, scale_factor,
+        measurement_width_mm, measurement_height_mm,
+        key_frame_paths, side_image_path, manual_hint_mm,
     )
+
+    if results:
+        return max(results, key=lambda r: r.confidence)
 
     default = settings.default_thickness_mm
     if manual_hint_mm is not None and manual_hint_mm > 0:

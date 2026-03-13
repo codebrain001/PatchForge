@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -39,8 +38,10 @@ class Agent:
     Base class for PatchForge pipeline agents.
 
     Each agent wraps a domain pipeline function and uses an LLM (Gemini
-    or OpenAI, with automatic fallback) to analyze results and produce
-    reasoning + suggestions.
+    or OpenAI, with automatic fallback) as its core decision engine.
+    The LLM is not optional — it IS the thinking layer that analyzes
+    results, arbitrates between competing strategies, and decides
+    whether the pipeline should proceed.
     """
 
     def __init__(self, name: str, role: str):
@@ -48,13 +49,16 @@ class Agent:
         self.role = role
 
     async def analyze(self, context: dict) -> AgentResult:
-        """Ask the configured LLM to reason about the pipeline stage output."""
+        """Ask the LLM to reason about the pipeline stage output.
+
+        Raises RuntimeError if no LLM is configured — the LLM is the
+        decision engine, not an optional enhancement.
+        """
         if not is_llm_available():
-            return AgentResult(
-                success=True,
-                data=context,
-                reasoning=f"[{self.name}] No LLM configured — skipping AI analysis.",
-                confidence=context.get("confidence", 1.0),
+            raise RuntimeError(
+                f"{self.name} requires an LLM to make decisions. "
+                "Set GEMINI_API_KEY or OPENAI_API_KEY in .env — "
+                "the LLM is the core thinking engine of this pipeline."
             )
 
         prompt = self._build_prompt(context)
@@ -77,14 +81,14 @@ class Agent:
                 confidence=parsed.get("confidence", context.get("confidence", 1.0)),
             )
 
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.warning("LLM analysis failed for %s: %s", self.name, e)
-            return AgentResult(
-                success=True,
-                data=context,
-                reasoning=f"[{self.name}] AI analysis unavailable: {e}",
-                confidence=context.get("confidence", 1.0),
-            )
+            raise RuntimeError(
+                f"{self.name} LLM call failed: {e}. "
+                "Check your API key and network connection."
+            ) from e
 
     async def analyze_with_vision(
         self,
@@ -95,11 +99,9 @@ class Agent:
     ) -> AgentResult:
         """Ask the LLM to reason about results while also looking at the image."""
         if not is_llm_available():
-            return AgentResult(
-                success=True,
-                data=context,
-                reasoning=f"[{self.name}] No LLM configured — skipping vision analysis.",
-                confidence=context.get("confidence", 1.0),
+            raise RuntimeError(
+                f"{self.name} requires an LLM for vision analysis. "
+                "Set GEMINI_API_KEY or OPENAI_API_KEY in .env."
             )
 
         full_prompt = self._build_prompt(context) + "\n\n" + vision_prompt
@@ -123,6 +125,8 @@ class Agent:
                 confidence=parsed.get("confidence", context.get("confidence", 1.0)),
             )
 
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.warning("LLM vision analysis failed for %s: %s", self.name, e)
             return await self.analyze(context)

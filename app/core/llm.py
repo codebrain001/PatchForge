@@ -244,9 +244,37 @@ def call_llm_vision(
     raise RuntimeError(f"All LLM providers failed. Last error: {last_error}")
 
 
-def parse_json_response(text: str) -> dict:
-    """Parse a JSON response from an LLM, handling markdown code fences."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    return json.loads(text)
+def parse_json_response(text: str | None) -> dict:
+    """Parse a JSON response from an LLM, handling markdown code fences.
+
+    Handles None, empty strings, markdown-wrapped JSON, and bare JSON.
+    Raises ValueError with a clear message on unparseable input.
+    """
+    if not text:
+        raise ValueError("LLM returned empty response — cannot parse JSON.")
+
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("LLM returned whitespace-only response — cannot parse JSON.")
+
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n", 1)
+        if len(lines) < 2:
+            raise ValueError(f"LLM returned malformed code fence with no content: {cleaned[:100]}")
+        cleaned = lines[1].rsplit("```", 1)[0].strip()
+
+    if not cleaned:
+        raise ValueError(f"LLM returned empty code fence: {text[:200]}")
+
+    try:
+        result = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        preview = cleaned[:300] + ("..." if len(cleaned) > 300 else "")
+        raise ValueError(
+            f"LLM returned invalid JSON: {e}. Response preview: {preview}"
+        ) from e
+
+    if not isinstance(result, dict):
+        raise ValueError(f"LLM returned {type(result).__name__} instead of JSON object: {cleaned[:200]}")
+
+    return result

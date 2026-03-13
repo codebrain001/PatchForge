@@ -23,6 +23,12 @@ def measure(
     if not contours:
         raise MeasurementError("No contours provided for measurement.")
 
+    if scale_factor <= 0:
+        raise MeasurementError(
+            f"Invalid scale factor: {scale_factor} mm/px. "
+            "Calibration must produce a positive scale factor before measurement."
+        )
+
     contour = contours[0]
 
     if cv2.contourArea(contour) < 100:

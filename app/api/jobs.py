@@ -52,9 +52,17 @@ async def segment_job(job_id: str, req: SegmentRequest):
     if not positive:
         raise HTTPException(400, "At least one positive click point is required.")
 
-    if not job.image_path:
+    image_path = job.image_path
+    if (
+        req.frame_index is not None
+        and job.key_frame_paths
+        and 0 <= req.frame_index < len(job.key_frame_paths)
+    ):
+        image_path = job.key_frame_paths[req.frame_index]
+
+    if not image_path:
         raise HTTPException(409, "No image attached to this job.")
-    image = cv2.imread(job.image_path)
+    image = cv2.imread(image_path)
     if image is None:
         raise HTTPException(500, "Stored image could not be read.")
 

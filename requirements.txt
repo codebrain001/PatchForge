@@ -7,12 +7,9 @@ opencv-contrib-python
 scipy
 shapely
 trimesh[easy]
-numpy-stl
 fastapi[standard]
 python-multipart
 Pillow
-aiofiles
-aiosqlite
 pydantic-settings
 google-genai
 openai

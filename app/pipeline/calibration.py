@@ -97,6 +97,62 @@ def calibrate_webxr(scale_mm_per_px: float) -> CalibrationResult:
     )
 
 
+def calibrate_all(
+    image: np.ndarray,
+    marker_size_mm: float = 40.0,
+    original_upload_path: Optional[str] = None,
+    ref_line_start: Optional[tuple[int, int]] = None,
+    ref_line_end: Optional[tuple[int, int]] = None,
+    ref_line_mm: Optional[float] = None,
+    webxr_scale: Optional[float] = None,
+) -> tuple[list[CalibrationResult], Optional[np.ndarray]]:
+    """
+    Run ALL applicable calibration strategies and return every result.
+
+    The LLM decides which result to trust — this function just collects evidence.
+    Also returns the extracted depth map (if any) for downstream thickness estimation.
+
+    Returns:
+        (list of CalibrationResults, depth_map or None)
+    """
+    results: list[CalibrationResult] = []
+    depth_map: Optional[np.ndarray] = None
+
+    # Strategy 1: HEIF depth extraction
+    if original_upload_path:
+        ext = Path(original_upload_path).suffix.lower()
+        if ext in (".heic", ".heif"):
+            depth_map = extract_depth_map(original_upload_path)
+            if depth_map is not None:
+                h, w = image.shape[:2]
+                result = calibrate_from_depth(original_upload_path, depth_map, w, h)
+                if result is not None:
+                    results.append(result)
+
+    # Strategy 2: ArUco marker detection (always attempted)
+    aruco_result = calibrate_aruco(image, marker_size_mm)
+    if aruco_result is not None:
+        results.append(aruco_result)
+
+    # Strategy 3: WebXR pre-computed scale
+    if webxr_scale is not None:
+        try:
+            results.append(calibrate_webxr(webxr_scale))
+        except CalibrationError:
+            pass
+
+    # Strategy 4: User-drawn reference line
+    if ref_line_start and ref_line_end and ref_line_mm:
+        try:
+            results.append(calibrate_manual(
+                tuple(ref_line_start), tuple(ref_line_end), ref_line_mm
+            ))
+        except CalibrationError:
+            pass
+
+    return results, depth_map
+
+
 def calibrate(
     image: np.ndarray,
     marker_size_mm: float = 40.0,
@@ -106,48 +162,14 @@ def calibrate(
     ref_line_mm: Optional[float] = None,
     webxr_scale: Optional[float] = None,
 ) -> CalibrationResult:
-    """
-    Hybrid calibration router. Tries strategies in priority order:
-    1. HEIF depth extraction (if original file is HEIC)
-    2. ArUco marker detection
-    3. WebXR pre-computed scale
-    4. User-drawn reference line
-    """
-    errors: list[str] = []
-
-    # Strategy 1: HEIF depth
-    if original_upload_path:
-        ext = Path(original_upload_path).suffix.lower()
-        if ext in (".heic", ".heif"):
-            depth_map = extract_depth_map(original_upload_path)
-            if depth_map is not None:
-                h, w = image.shape[:2]
-                result = calibrate_from_depth(original_upload_path, depth_map, w, h)
-                if result is not None:
-                    return result
-                errors.append("HEIF depth map found but scale computation failed.")
-            else:
-                errors.append("HEIF file has no embedded depth map.")
-
-    # Strategy 2: ArUco
-    result = calibrate_aruco(image, marker_size_mm)
-    if result is not None:
-        return result
-    errors.append("No ArUco marker detected.")
-
-    # Strategy 3: WebXR
-    if webxr_scale is not None:
-        return calibrate_webxr(webxr_scale)
-
-    # Strategy 4: Manual reference line
-    if ref_line_start and ref_line_end and ref_line_mm:
-        if len(ref_line_start) != 2 or len(ref_line_end) != 2:
-            raise CalibrationError("Reference line points must each have exactly 2 coordinates [x, y].")
-        return calibrate_manual(
-            tuple(ref_line_start), tuple(ref_line_end), ref_line_mm
-        )
-
-    raise CalibrationError(
-        "No calibration method succeeded. Tried: " + "; ".join(errors)
-        + ". Please draw a reference line on a known object, or include an ArUco marker."
+    """Legacy single-result wrapper. Prefer calibrate_all() + LLM consensus."""
+    results, _ = calibrate_all(
+        image, marker_size_mm, original_upload_path,
+        ref_line_start, ref_line_end, ref_line_mm, webxr_scale,
     )
+    if not results:
+        raise CalibrationError(
+            "No calibration method succeeded. "
+            "Please draw a reference line on a known object, or include an ArUco marker."
+        )
+    return max(results, key=lambda r: r.confidence)

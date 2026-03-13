@@ -24,19 +24,22 @@ logger = logging.getLogger("patchforge.app")
 
 async def _llm_health_check() -> None:
     """Validate LLM provider on startup so misconfiguration is caught early."""
+    import asyncio
     from app.core.llm import is_llm_available, get_active_provider, call_llm
 
     provider = get_active_provider()
     if not is_llm_available():
-        logger.warning(
-            "No LLM provider configured. Set GEMINI_API_KEY or OPENAI_API_KEY in .env. "
-            "Agent reasoning will be skipped."
+        logger.error(
+            "CRITICAL: No LLM provider configured. Set GEMINI_API_KEY or OPENAI_API_KEY in .env. "
+            "The LLM is the core decision engine — the pipeline cannot make calibration or "
+            "thickness decisions without it."
         )
         return
 
     logger.info("LLM provider configured: %s — sending health-check...", provider)
     try:
-        _, used = call_llm(
+        _, used = await asyncio.to_thread(
+            call_llm,
             "You are a health-check bot.",
             "Reply with exactly: OK",
         )

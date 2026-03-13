@@ -23,9 +23,12 @@ logger = logging.getLogger("patchforge.prompt_to_mesh")
 PARSE_SYSTEM_PROMPT = """\
 You are a precise engineering assistant that converts natural language
 descriptions of patches or 3D-printable parts into structured JSON.
+The target printer is a Bambu Lab A1 with a maximum build volume of
+256 x 256 x 256 mm. All dimensions must fit within this volume.
 
 RULES:
 - Extract the shape type, all dimensions, and thickness.
+- Reject or warn if any dimension exceeds 256 mm.
 - Resolve size references to millimetres using common objects:
     UK 1 pound coin = 23.43 mm diameter
     UK 2 pound coin = 28.4 mm diameter
@@ -63,12 +66,7 @@ Respond with ONLY valid JSON (no markdown, no explanation):
 async def parse_prompt(prompt: str) -> dict[str, Any]:
     """Parse a natural language prompt into structured shape parameters."""
     import asyncio
-    from app.core.llm import call_llm, parse_json_response, is_llm_available
-
-    if not is_llm_available():
-        raise RuntimeError(
-            "No LLM provider configured. Set GEMINI_API_KEY or OPENAI_API_KEY."
-        )
+    from app.core.llm import call_llm, parse_json_response
 
     text, provider = await asyncio.to_thread(
         call_llm, PARSE_SYSTEM_PROMPT, prompt,
@@ -89,9 +87,9 @@ async def parse_prompt(prompt: str) -> dict[str, Any]:
         width = float(diameter)
         height = float(diameter)
 
-    width = max(1.0, min(width, 500.0))
-    height = max(1.0, min(height, 500.0))
-    thickness = max(0.5, min(thickness, 50.0))
+    width = max(1.0, min(width, 256.0))
+    height = max(1.0, min(height, 256.0))
+    thickness = max(0.5, min(thickness, 256.0))
 
     result = {
         "shape_type": shape_type,

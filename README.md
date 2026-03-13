@@ -18,19 +18,48 @@ PatchForge is built as a **7-agent pipeline** where each agent executes a domain
 Upload → Calibration → Segmentation → Measurement → Thickness → Mesh → Validation → Print
 ```
 
-| Agent | Pipeline Function | LLM Role |
+| Agent | Pipeline Functions | LLM Decision Role |
 |-------|-------------------|----------|
-| **Calibration** | ArUco / HEIF depth / reference line / WebXR | Evaluates calibration confidence |
-| **Segmentation** | SAM 2 with point prompts | Assesses mask quality |
-| **Measurement** | OpenCV contour analysis | Checks plausibility against scale |
-| **Thickness** | LiDAR / Video MVS / side photo / manual | Evaluates estimate confidence |
-| **Mesh** | Shapely + trimesh extrusion + chamfer | Assesses printability |
-| **Validation** | Cross-checks all pipeline results | Final go/no-go judgment |
-| **Printer** | bambulabs_api MQTT/FTP | Analyzes printer status |
+| **Calibration** | ArUco / HEIF depth / reference line / WebXR / vision | Runs ALL strategies, sees ALL results, picks the best scale factor or blends them |
+| **Segmentation** | SAM 2 with point prompts | Assesses mask quality, suggests better click points |
+| **Measurement** | OpenCV contour analysis + vision measurement | Arbitrates between pixel-based and vision-based measurements |
+| **Thickness** | LiDAR / Video MVS / side photo / monocular depth / vision | Runs ALL strategies, sees ALL estimates, decides final thickness |
+| **Mesh** | Shapely + trimesh extrusion + chamfer | Assesses printability, suggests thickness/chamfer adjustments |
+| **Validation** | Cross-checks all pipeline results | Final go/no-go judgment on the entire pipeline |
+| **Printer** | bambulabs_api MQTT/FTP | Monitors print status, flags issues |
 
-All agents extend a common base class (`app/agents/base.py`) with structured Gemini output, graceful degradation if the API key is missing, and an `AgentResult` containing reasoning, suggestions, confidence, and a proceed flag.
+All agents extend a common base class (`app/agents/base.py`) with structured LLM output and an `AgentResult` containing reasoning, suggestions, confidence, and a proceed flag.
 
-**No LLM lock-in** — the pipeline runs end-to-end without an LLM; AI reasoning is additive, not required.
+**The LLM is the decision engine** — every agent uses the LLM to arbitrate between competing strategies, assess confidence, and decide whether the pipeline should proceed. When multiple calibration or thickness estimates are available, the LLM runs a consensus protocol: it sees ALL candidates and picks the most trustworthy result (or blends them). This is not optional decoration — it is the core intelligence of the system.
+
+### Consensus Decision Protocol
+
+Calibration and thickness estimation both follow the same pattern:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                   Run ALL strategies                     │
+│                                                          │
+│  HEIF depth ──┐                                         │
+│  ArUco marker ─┼─── Collect ALL results ─── LLM sees    │
+│  WebXR AR ─────┤    with confidence scores    every      │
+│  Reference ────┘                            candidate    │
+│                                                 │        │
+│                              ┌───────────────────┘       │
+│                              ▼                           │
+│                   LLM Consensus Decision                 │
+│                   ─ Pick best result                     │
+│                   ─ Blend if strategies agree            │
+│                   ─ Explain reasoning                    │
+│                   ─ Flag implausible values              │
+│                              │                           │
+│                              ▼                           │
+│                 Single authoritative result               │
+│                 with explained confidence                 │
+└──────────────────────────────────────────────────────────┘
+```
+
+The depth map extracted during calibration is passed directly to the thickness agent, avoiding redundant I/O and enabling cross-stage reasoning.
 
 ## Tech Stack
 

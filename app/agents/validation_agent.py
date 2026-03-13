@@ -5,11 +5,13 @@ from app.models.job import CalibrationResult, MeasurementResult, MeshResult
 
 ROLE = (
     "You are a holistic quality assurance agent for a photo-to-3D-print pipeline. "
+    "The target printer is a Bambu Lab A1 with a maximum build volume of "
+    "256 x 256 x 256 mm. "
     "You review the entire pipeline output: calibration accuracy, segmentation quality, "
     "dimensional plausibility, and mesh printability. "
     "Produce a final human-readable summary and print recommendations. "
-    "Consider common 3D printing constraints: minimum wall thickness (0.8mm), "
-    "maximum build volume (220x220x250mm for typical printers), overhang angles, etc."
+    "Consider 3D printing constraints: minimum wall thickness (0.8mm), "
+    "maximum build volume (256 x 256 x 256 mm), overhang angles, etc."
 )
 
 

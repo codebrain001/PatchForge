@@ -13,6 +13,7 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
+from app.core.storage import validate_job_id
 from app.models.job import Job
 
 logger = logging.getLogger("patchforge.job_store")
@@ -55,6 +56,10 @@ def _init_cache() -> None:
 
 def get_job(job_id: str) -> Optional[Job]:
     _init_cache()
+    try:
+        validate_job_id(job_id)
+    except ValueError:
+        return None
     return _cache.get(job_id)
 
 

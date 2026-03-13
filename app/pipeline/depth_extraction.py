@@ -6,7 +6,7 @@ then combines it with EXIF focal length to compute a mm-per-pixel scale factor.
 """
 from __future__ import annotations
 
-import math
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +15,8 @@ from PIL import Image
 from PIL.ExifTags import Base as ExifBase
 
 from app.models.job import CalibrationResult
+
+logger = logging.getLogger("patchforge.depth")
 
 # Known iPhone sensor widths in mm, keyed by EXIF model substring
 _SENSOR_WIDTHS: dict[str, float] = {
@@ -43,21 +45,25 @@ def extract_depth_map(image_path: str | Path) -> Optional[np.ndarray]:
         from pillow_heif import register_heif_opener
         register_heif_opener()
     except ImportError:
+        logger.debug("pillow-heif not installed — skipping HEIF depth extraction")
         return None
 
     try:
         im = Image.open(str(image_path))
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to open HEIF image %s: %s", image_path, e)
         return None
 
     depth_images = im.info.get("depth_images")
     if not depth_images:
+        logger.debug("No depth_images in HEIF metadata for %s", image_path)
         return None
 
     try:
         depth_pil = depth_images[0].to_pillow()
         return np.asarray(depth_pil, dtype=np.float32)
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to convert depth image to array: %s", e)
         return None
 
 
@@ -66,7 +72,8 @@ def _get_exif_data(image_path: str | Path) -> dict:
         im = Image.open(str(image_path))
         exif = im.getexif()
         return exif if exif else {}
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to read EXIF from %s: %s", image_path, e)
         return {}
 
 

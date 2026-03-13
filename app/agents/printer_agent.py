@@ -6,7 +6,8 @@ from app.agents.base import Agent, AgentResult
 from app.models.job import PrintStatus, MeshResult
 
 ROLE = (
-    "You are a 3D print monitoring agent for a Bambu Lab A1 printer. "
+    "You are a 3D print monitoring agent for a Bambu Lab A1 printer "
+    "(build volume: 256 x 256 x 256 mm). "
     "You evaluate printer status during a print job: temperature stability, "
     "progress rate, error codes, and overall health. "
     "Flag any issues: abnormal temperatures (bed >70C, nozzle >250C for PLA), "
